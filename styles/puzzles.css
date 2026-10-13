@@ -146,3 +146,24 @@
   opacity: 0.75;
   white-space: nowrap;
 }
+
+/* Drop zone shown while an object from a pan is being dragged */
+.theia-puzzle .tp-dropzone {
+  display: none;
+  padding: 14px 8px;
+  text-align: center;
+  font-size: 13px;
+  border: 2px dashed rgba(240, 192, 64, 0.5);
+  border-radius: 6px;
+  color: #f0d7a0;
+}
+.theia-puzzle.tp-dragging .tp-dropzone {
+  display: block;
+}
+.theia-puzzle.tp-drop-hover .tp-side {
+  background: rgba(70, 52, 22, 0.95);
+}
+.theia-puzzle.tp-drop-hover .tp-dropzone {
+  border-color: #f0c040;
+  background: rgba(240, 192, 64, 0.15);
+}

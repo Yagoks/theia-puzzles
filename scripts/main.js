@@ -6,8 +6,8 @@
 // - The puzzle state lives on the scene: `flags.theia-puzzles.state.<puzzleId>`. Every client renders from it.
 // - Only the active GM mutates state and actor sheets. Players send requests over the module socket; the GM
 //   validates (lock owner, distance, weights) and applies them one at a time.
-// - One operator at a time ("Interagir", must stand within reach of the pedestal); anyone can "Assistir"
-//   from anywhere in the scene and watch live.
+// - One operator at a time ("Interact", must stand within reach of the pedestal); anyone can "Watch"
+//   from anywhere in the scene and follow it live.
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 
@@ -24,17 +24,15 @@ const COINS_PER_KG = 110; // dnd5e metric currency weight (50 coins per lb)
 const PUZZLES = {
   "l03-balanca": {
     type: "scale",
-    title: "Balança do tributo",
+    title: "Tribute Scale",
     reachFt: 5,
     maxPanKg: 5,
-    modelUrl: null, // GLB of the scale (step 2); null uses the built-in placeholder
-    initial: () => ({
-      left: [0, 1, 2].map(i => ({
-        id: `soul${i}`, kind: "soul", kg: 0.2, name: "Soul Coin",
-        img: "icons/commodities/currency/coin-embossed-skull-gold.webp"
-      })),
-      right: []
-    })
+    modelUrl: null, // GLB of the scale (later step); null uses the built-in placeholder
+    // The coins in the pan are copies of this world item (Items > Abbandoned Mansion Itens > Soul Coin).
+    soulItem: { uuid: "Item.3jaI1tQwMTsR1nA0", name: "Soul Coin" },
+    // Face texture for the 3D coin (a copy on the Forge assets, which allow WebGL use).
+    soulTexture: "https://assets.forge-vtt.com/63def5083cd17e6cc9b2ed99/Atlantis/Tiles/Puzzles/soul_coin.webp",
+    soulCount: 3
   }
 };
 
@@ -42,7 +40,7 @@ const PUZZLES = {
 /*  Helpers                                     */
 /* -------------------------------------------- */
 
-const fmtKg = kg => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${(Math.round(kg * 100) / 100).toLocaleString("pt-BR")} kg`);
+const fmtKg = kg => (kg < 1 ? `${Math.round(kg * 1000)} g` : `${Math.round(kg * 100) / 100} kg`);
 const panKg = pan => (pan ?? []).reduce((s, e) => s + (e.kg ?? 0), 0);
 
 function itemKgEach(item) {
@@ -55,11 +53,31 @@ function itemKgEach(item) {
   return (value * from) / toKg;
 }
 
+function soulSource(def) {
+  return (def.soulItem?.uuid && fromUuidSync(def.soulItem.uuid)) || game.items.find(i => i.name === def.soulItem?.name) || null;
+}
+
+function isSoul(def, itemOrData) {
+  return !!def.soulItem && itemOrData?.name === def.soulItem.name;
+}
+
+function soulEntry(def, data = null) {
+  const src = soulSource(def);
+  return {
+    id: foundry.utils.randomID(), kind: "soul", name: def.soulItem.name,
+    img: data?.img ?? src?.img ?? "icons/commodities/currency/coin-embossed-skull-gold.webp",
+    tex: def.soulTexture ?? null, kg: src ? itemKgEach(src) || 0.2 : 0.2, data
+  };
+}
+
+function initialState(def) {
+  return { lock: null, pans: { left: Array.from({ length: def.soulCount ?? 0 }, () => soulEntry(def)), right: [] } };
+}
+
 function getState(scene, puzzleId) {
-  const def = PUZZLES[puzzleId];
   const saved = scene?.getFlag(MODULE_ID, `state.${puzzleId}`);
   if (saved) return foundry.utils.deepClone(saved);
-  return { lock: null, pans: def.initial() };
+  return initialState(PUZZLES[puzzleId]);
 }
 
 function findPedestal(scene, puzzleId) {
@@ -71,7 +89,7 @@ function findPuzzleScene(puzzleId) {
   return game.scenes.find(s => findPedestal(s, puzzleId)) ?? null;
 }
 
-/** Distance in feet from a token to the pedestal tile's footprint. */
+/** Distance in feet from a token's edge to the pedestal tile's footprint. */
 function distanceToPedestalFt(tokenDoc, tile) {
   const scene = tile.parent, g = scene.grid.size, gd = scene.grid.distance;
   const cx = tokenDoc.x + (tokenDoc.width * g) / 2, cy = tokenDoc.y + (tokenDoc.height * g) / 2;
@@ -91,11 +109,22 @@ function nearTokenFor(user, scene, puzzleId) {
   return candidates.find(t => t.parent === scene && t.actor && distanceToPedestalFt(t, tile) <= reach + 0.01) ?? null;
 }
 
+/** Give an item (data) to an actor, stacking onto a matching item when there is one. */
+async function giveItem(actor, data) {
+  // Plutonium silently cancels the creation of items that still carry its import flag.
+  if (data.flags?.plutonium) { data = foundry.utils.deepClone(data); delete data.flags.plutonium; }
+  const qty = Number(data.system?.quantity ?? 1) || 1;
+  const same = actor.items.find(i => i.name === data.name && i.type === data.type && i.system.quantity !== undefined);
+  if (same) return same.update({ "system.quantity": (Number(same.system.quantity) || 0) + qty });
+  return actor.createEmbeddedDocuments("Item", [data]);
+}
+
 /* -------------------------------------------- */
 /*  GM authority                                */
 /* -------------------------------------------- */
 
 let gmQueue = Promise.resolve();
+const pending = {};
 
 function isActiveGM() {
   return game.user.isGM && game.users.activeGM?.isSelf;
@@ -105,16 +134,15 @@ async function request(type, payload = {}) {
   const msg = { type, payload, userId: game.user.id, rid: foundry.utils.randomID() };
   if (isActiveGM()) return gmHandle(msg);
   if (!game.users.activeGM) {
-    ui.notifications.warn("Theia Puzzles: nenhum GM conectado.");
+    ui.notifications.warn("Theia Puzzles: no GM is connected.");
     return { ok: false };
   }
   return new Promise(resolve => {
-    const timer = setTimeout(() => { delete pending[msg.rid]; resolve({ ok: false, msg: "Sem resposta do GM." }); }, 8000);
-    pending[msg.rid] = r => { clearTimeout(timer); resolve(r); };
+    const timer = setTimeout(() => { delete pending[msg.rid]; resolve({ ok: false, msg: "No answer from the GM." }); }, 8000);
+    pending[msg.rid] = r => { clearTimeout(timer); delete pending[msg.rid]; resolve(r); };
     game.socket.emit(SOCKET, msg);
   });
 }
-const pending = {};
 
 function gmHandle(msg) {
   const run = () => gmApply(msg).catch(err => {
@@ -128,26 +156,27 @@ function gmHandle(msg) {
 async function gmApply({ type, payload, userId }) {
   const { puzzleId } = payload;
   const def = PUZZLES[puzzleId];
-  if (!def) return { ok: false, msg: "Puzzle desconhecido." };
+  if (!def) return { ok: false, msg: "Unknown puzzle." };
   const scene = game.scenes.get(payload.sceneId) ?? findPuzzleScene(puzzleId);
-  if (!scene) return { ok: false, msg: "Cena do puzzle não encontrada." };
+  if (!scene) return { ok: false, msg: "Puzzle scene not found." };
   const user = game.users.get(userId);
   const state = getState(scene, puzzleId);
   const save = () => scene.setFlag(MODULE_ID, `state.${puzzleId}`, state);
   const now = Date.now();
   const lockStale = state.lock && (now - state.lock.ts > LOCK_TIMEOUT_MS || !game.users.get(state.lock.userId)?.active);
   const holdsLock = state.lock?.userId === userId;
+  const limitMsg = pan => `A pan holds at most ${def.maxPanKg} kg (it has ${fmtKg(panKg(pan))}).`;
 
   switch (type) {
     case "claim": {
       if (state.lock && !holdsLock && !lockStale && !user.isGM)
-        return { ok: false, msg: `${state.lock.userName} já está interagindo com a balança.` };
+        return { ok: false, msg: `${state.lock.actorName ?? state.lock.userName} is already using the scale.` };
       const tok = payload.tokenUuid ? fromUuidSync(payload.tokenUuid) : null;
       const tile = findPedestal(scene, puzzleId);
-      if (!tok?.actor || tok.parent !== scene) return { ok: false, msg: "Selecione o token do seu personagem." };
-      if (!user.isGM && !tok.actor.testUserPermission(user, "OWNER")) return { ok: false, msg: "Esse token não é seu." };
+      if (!tok?.actor || tok.parent !== scene) return { ok: false, msg: "Select your character's token." };
+      if (!user.isGM && !tok.actor.testUserPermission(user, "OWNER")) return { ok: false, msg: "That token isn't yours." };
       if (!user.isGM && distanceToPedestalFt(tok, tile) > def.reachFt + 0.01)
-        return { ok: false, msg: `Aproxime-se: é preciso estar a até ${def.reachFt} ft da balança.` };
+        return { ok: false, msg: `Move closer: you must be within ${def.reachFt} ft of the scale.` };
       state.lock = { userId, userName: user.name, tokenUuid: tok.uuid, actorName: tok.name, ts: now };
       await save();
       return { ok: true };
@@ -165,17 +194,17 @@ async function gmApply({ type, payload, userId }) {
       return { ok: true };
     }
     case "reset": {
-      if (!user.isGM) return { ok: false, msg: "Só o GM pode resetar." };
-      await scene.unsetFlag(MODULE_ID, `state.${puzzleId}`);
+      if (!user.isGM) return { ok: false, msg: "Only the GM can reset the puzzle." };
+      await scene.setFlag(MODULE_ID, `state.${puzzleId}`, initialState(def));
       return { ok: true };
     }
   }
 
   // ----- mutating actions: only the lock holder (or a GM) -----
-  if (!holdsLock && !user.isGM) return { ok: false, msg: "Você não está interagindo com a balança." };
+  if (!holdsLock && !user.isGM) return { ok: false, msg: "You aren't using the scale." };
   const tokenDoc = state.lock?.tokenUuid ? fromUuidSync(state.lock.tokenUuid) : null;
   const actor = tokenDoc?.actor;
-  if (!actor) return { ok: false, msg: "Personagem não encontrado." };
+  if (!actor) return { ok: false, msg: "Character not found." };
   if (state.lock) state.lock.ts = now;
   const panName = payload.pan === "left" ? "left" : "right";
   const pan = state.pans[panName];
@@ -183,38 +212,60 @@ async function gmApply({ type, payload, userId }) {
   switch (type) {
     case "placeItem": {
       const item = actor.items.get(payload.itemId);
-      if (!item) return { ok: false, msg: "Item não encontrado na ficha." };
+      if (!item) return { ok: false, msg: "Item not found on the sheet." };
       const each = itemKgEach(item);
-      if (each <= 0) return { ok: false, msg: "Itens sem peso não podem ser colocados na balança." };
+      if (each <= 0) return { ok: false, msg: "Weightless items can't be placed on the scale." };
       const have = Number(item.system.quantity ?? 1) || 1;
       const qty = Math.max(1, Math.min(have, Math.floor(Number(payload.qty) || 1)));
       const kg = each * qty;
-      if (panKg(pan) + kg > def.maxPanKg + 1e-9)
-        return { ok: false, msg: `O prato aguenta no máximo ${def.maxPanKg} kg (tem ${fmtKg(panKg(pan))}).` };
+      if (panKg(pan) + kg > def.maxPanKg + 1e-9) return { ok: false, msg: limitMsg(pan) };
       const data = item.toObject();
       delete data._id;
-      foundry.utils.setProperty(data, "system.quantity", qty);
       if (qty >= have) await item.delete();
       else await item.update({ "system.quantity": have - qty });
-      pan.push({ id: foundry.utils.randomID(), kind: "item", name: item.name, img: item.img, kg, qty, data, by: actor.name });
+      if (isSoul(def, item)) {
+        // Soul Coins stay coins on the scale: one coin per unit, each taken on its own.
+        for (let i = 0; i < qty; i++) {
+          const one = foundry.utils.deepClone(data);
+          foundry.utils.setProperty(one, "system.quantity", 1);
+          pan.push(soulEntry(def, one));
+        }
+      } else {
+        foundry.utils.setProperty(data, "system.quantity", qty);
+        pan.push({ id: foundry.utils.randomID(), kind: "item", name: item.name, img: item.img, kg, qty, data, by: actor.name });
+      }
       await save();
       return { ok: true };
     }
     case "placeCurrency": {
       const denom = payload.denom;
-      if (!CONFIG.DND5E.currencies[denom]) return { ok: false, msg: "Moeda inválida." };
+      if (!CONFIG.DND5E.currencies[denom]) return { ok: false, msg: "Invalid currency." };
       const have = Number(actor.system.currency?.[denom]) || 0;
       const amount = Math.floor(Number(payload.amount) || 0);
-      if (amount <= 0) return { ok: false, msg: "Informe uma quantidade." };
-      if (amount > have) return { ok: false, msg: `Você só tem ${have} ${denom}.` };
+      if (amount <= 0) return { ok: false, msg: "Enter an amount." };
+      if (amount > have) return { ok: false, msg: `You only have ${have} ${denom}.` };
       const kg = amount / COINS_PER_KG;
-      if (panKg(pan) + kg > def.maxPanKg + 1e-9)
-        return { ok: false, msg: `O prato aguenta no máximo ${def.maxPanKg} kg (tem ${fmtKg(panKg(pan))}).` };
+      if (panKg(pan) + kg > def.maxPanKg + 1e-9) return { ok: false, msg: limitMsg(pan) };
       await actor.update({ [`system.currency.${denom}`]: have - amount });
       const pile = pan.find(e => e.kind === "currency" && e.denom === denom);
       if (pile) { pile.amount += amount; pile.kg = pile.amount / COINS_PER_KG; }
       else pan.push({ id: foundry.utils.randomID(), kind: "currency", denom, amount, kg, name: CONFIG.DND5E.currencies[denom].label });
       await save();
+      return { ok: true };
+    }
+    case "move": {
+      let entry = null, from = null;
+      for (const side of ["left", "right"]) {
+        const i = state.pans[side].findIndex(e => e.id === payload.entryId);
+        if (i >= 0) { from = side; entry = state.pans[side][i]; break; }
+      }
+      if (!entry) return { ok: false, msg: "That object is no longer on the scale." };
+      if (from === panName) return { ok: true };
+      if (panKg(pan) + entry.kg > def.maxPanKg + 1e-9) return { ok: false, msg: limitMsg(pan) };
+      state.pans[from] = state.pans[from].filter(e => e.id !== entry.id);
+      pan.push(entry);
+      await save();
+      Hooks.callAll(`${MODULE_ID}.moved`, { puzzleId, scene, entry, from, to: panName, actor, state });
       return { ok: true };
     }
     case "take": {
@@ -223,31 +274,30 @@ async function gmApply({ type, payload, userId }) {
         const i = state.pans[side].findIndex(e => e.id === payload.entryId);
         if (i >= 0) { from = side; entry = state.pans[side].splice(i, 1)[0]; break; }
       }
-      if (!entry) return { ok: false, msg: "Esse objeto já foi retirado." };
+      if (!entry) return { ok: false, msg: "That object was already taken." };
       if (entry.kind === "item") {
-        // stack back onto a matching item when the sheet already has one
-        const same = actor.items.find(i => i.name === entry.data.name && i.type === entry.data.type
-          && (i.system.quantity ?? null) !== null && (entry.data.system?.quantity ?? null) !== null);
-        if (same) await same.update({ "system.quantity": (Number(same.system.quantity) || 0) + (Number(entry.data.system.quantity) || 1) });
-        else await actor.createEmbeddedDocuments("Item", [entry.data]);
+        await giveItem(actor, entry.data);
       } else if (entry.kind === "currency") {
         const have = Number(actor.system.currency?.[entry.denom]) || 0;
         await actor.update({ [`system.currency.${entry.denom}`]: have + entry.amount });
       } else if (entry.kind === "soul") {
-        const own = actor.items.find(i => i.name === entry.name && i.type === "loot");
-        if (own) await own.update({ "system.quantity": (Number(own.system.quantity) || 0) + 1 });
-        else await actor.createEmbeddedDocuments("Item", [{
-          name: entry.name, type: "loot", img: entry.img,
-          system: { quantity: 1, weight: { value: entry.kg, units: "kg" },
-            description: { value: "<p>Uma moeda escurecida, fria ao toque. Parece pulsar fracamente.</p>" } }
-        }]);
+        let data = entry.data;
+        if (!data) {
+          const src = soulSource(def);
+          data = src ? src.toObject() : { name: entry.name, type: "loot", img: entry.img, system: { weight: { value: entry.kg, units: "kg" } } };
+          delete data._id;
+          delete data.folder;
+          delete data.ownership;
+        }
+        foundry.utils.setProperty(data, "system.quantity", 1);
+        await giveItem(actor, data);
       }
       await save();
       Hooks.callAll(`${MODULE_ID}.taken`, { puzzleId, scene, entry, from, actor, state });
       return { ok: true };
     }
   }
-  return { ok: false, msg: `Ação desconhecida: ${type}` };
+  return { ok: false, msg: `Unknown action: ${type}` };
 }
 
 /* -------------------------------------------- */
@@ -255,15 +305,25 @@ async function gmApply({ type, payload, userId }) {
 /* -------------------------------------------- */
 
 const DENOM_COLOR = { pp: 0xe8ecf2, gp: 0xf0c040, sp: 0xc8ccd2, cp: 0xc0703a };
+const GRAVITY = 9.8;
 
 class ScaleView {
-  constructor(container, { onTake, onDrop, canInteract }) {
+  /**
+   * @param {HTMLElement} container
+   * @param {object} hooks
+   * @param {() => boolean} hooks.canInteract
+   * @param {(entryId: string) => Promise<boolean>} hooks.onTake      dropped on the inventory panel
+   * @param {(entryId: string, pan: string) => Promise<boolean>} hooks.onMove  dropped on the other pan
+   * @param {(data: object, pan: string) => void} hooks.onDrop         HTML item dragged in from the panel
+   * @param {(x: number, y: number) => boolean} hooks.isOverInventory
+   * @param {(over: boolean|null) => void} hooks.onDragState           null = drag ended
+   */
+  constructor(container, hooks) {
     this.container = container;
-    this.onTake = onTake;
-    this.onDrop = onDrop;
-    this.canInteract = canInteract;
+    this.hooks = hooks;
     this.entryMeshes = new Map(); // entryId -> mesh
     this.textures = new Map();
+    this.anims = [];
     this.tilt = 0;
     this.tiltVel = 0;
     this.targetTilt = 0;
@@ -298,7 +358,7 @@ class ScaleView {
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
     key.shadow.camera.near = 0.5; key.shadow.camera.far = 6;
-    Object.assign(key.shadow.camera, { left: -1, right: 1, top: 1, bottom: -1 });
+    Object.assign(key.shadow.camera, { left: -1.2, right: 1.2, top: 1.2, bottom: -1.2 });
     this.scene.add(key);
     const rim = new THREE.PointLight(0x7fa6ff, 0.6, 5);
     rim.position.set(-1.4, 1.2, -1.2);
@@ -309,7 +369,7 @@ class ScaleView {
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2();
     this.hovered = null;
-    this.hold = null;
+    this.drag = null;
     this._bindEvents();
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -329,9 +389,11 @@ class ScaleView {
     floor.receiveShadow = true;
     this.scene.add(floor);
 
+    this.pedestalTop = 0.32;
     const pedestal = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.32, 0.5), stone);
     pedestal.position.y = 0.16;
     pedestal.castShadow = pedestal.receiveShadow = true;
+    this.pedestal = pedestal;
     this.scene.add(pedestal);
 
     const post = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.04, 0.42, 20), bronze);
@@ -345,8 +407,7 @@ class ScaleView {
     const beam = new THREE.Mesh(new THREE.BoxGeometry(0.84, 0.022, 0.03), bronze);
     beam.castShadow = true;
     this.pivot.add(beam);
-    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.032, 20, 14), dark);
-    this.pivot.add(cap);
+    this.pivot.add(new THREE.Mesh(new THREE.SphereGeometry(0.032, 20, 14), dark));
 
     this.beamEnds = { left: new THREE.Object3D(), right: new THREE.Object3D() };
     this.beamEnds.left.position.set(-0.4, 0, 0);
@@ -364,47 +425,75 @@ class ScaleView {
       for (let i = 0; i < 3; i++) {
         const a = (i / 3) * Math.PI * 2;
         const pts = [new THREE.Vector3(Math.cos(a) * 0.14, -0.29, Math.sin(a) * 0.14), new THREE.Vector3(0, 0, 0)];
-        const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x9a7a4a }));
-        g.add(line);
+        g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x9a7a4a })));
       }
       const content = new THREE.Group();
       content.position.y = -0.3 + 0.0125;
+      content.userData.pan = side;
       g.add(content);
       this.scene.add(g);
       this.pans[side] = { group: g, dish, content };
     }
   }
 
-  _texture(url) {
-    if (!url) return null;
-    if (this.textures.has(url)) return this.textures.get(url);
-    const loader = new THREE.TextureLoader();
-    loader.setCrossOrigin("anonymous");
-    const tex = loader.load(url, undefined, undefined, () => {});
+  /** Texture from an image URL; images from hosts that block WebGL use (CORS) fall back to a name label. */
+  _texture(url, label = "") {
+    if (!url) return this._labelTexture(label);
+    const key = `${url}|${label}`;
+    if (this.textures.has(key)) return this.textures.get(key);
+    const tex = new THREE.Texture();
     tex.colorSpace = THREE.SRGBColorSpace;
-    this.textures.set(url, tex);
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => { tex.image = img; tex.needsUpdate = true; };
+    img.onerror = () => {
+      const fb = this._labelTexture(label);
+      tex.image = fb.image;
+      tex.needsUpdate = true;
+    };
+    img.src = url;
+    this.textures.set(key, tex);
     return tex;
   }
 
-  /** Rebuild the pan contents from the puzzle state. */
+  _labelTexture(label) {
+    const c = document.createElement("canvas");
+    c.width = c.height = 256;
+    const g = c.getContext("2d");
+    g.fillStyle = "#3b2f22"; g.fillRect(0, 0, 256, 256);
+    g.strokeStyle = "#c9a35a"; g.lineWidth = 10; g.strokeRect(8, 8, 240, 240);
+    g.fillStyle = "#f2e2c0"; g.textAlign = "center"; g.textBaseline = "middle";
+    const words = String(label || "?").split(/\s+/).slice(0, 4);
+    g.font = "bold 44px sans-serif";
+    words.forEach((w, i) => g.fillText(w.slice(0, 10), 128, 128 + (i - (words.length - 1) / 2) * 50));
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  /** Rebuild the pan contents from the puzzle state (deferred while something is being dragged/animated). */
   update(state) {
+    if (this.drag || this.anims.length) { this.pendingState = state; return; }
+    this.pendingState = null;
     for (const mesh of this.entryMeshes.values()) {
       mesh.parent?.remove(mesh);
       mesh.geometry?.dispose();
     }
     this.entryMeshes.clear();
-    this.hovered = null;
+    this._setHover(null);
 
     for (const side of ["left", "right"]) {
       const content = this.pans[side].content;
       const entries = state.pans[side] ?? [];
+      let souls = 0;
       entries.forEach((e, i) => {
         const mesh = this._entryMesh(e);
-        const slot = this._slot(i, entries.length);
-        mesh.position.x = slot.x;
-        mesh.position.z = slot.z;
-        mesh.position.y = slot.y + (mesh.userData.height ?? 0) / 2;
+        let slot;
+        if (e.kind === "soul") slot = { x: -0.05, z: 0.02, y: souls++ * (mesh.userData.height + 0.001) };
+        else slot = this._slot(i, entries.length);
+        mesh.position.set(slot.x, slot.y + mesh.userData.height / 2, slot.z);
         mesh.userData.entryId = e.id;
+        mesh.userData.pan = side;
         mesh.castShadow = true;
         content.add(mesh);
         this.entryMeshes.set(e.id, mesh);
@@ -415,7 +504,7 @@ class ScaleView {
   }
 
   _slot(i, n) {
-    if (n === 1 || i === 0) return { x: 0, z: 0, y: 0 };
+    if (n === 1 || i === 0) return { x: 0.03, z: -0.02, y: 0 };
     const ring = (i - 1) % 6, layer = Math.floor((i - 1) / 6);
     const a = (ring / 6) * Math.PI * 2;
     return { x: Math.cos(a) * 0.075, z: Math.sin(a) * 0.075, y: layer * 0.05 };
@@ -425,8 +514,9 @@ class ScaleView {
     let mesh;
     if (e.kind === "soul") {
       const h = 0.009;
-      mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, h, 28),
-        new THREE.MeshStandardMaterial({ color: 0x4a3a20, metalness: 0.9, roughness: 0.4, emissive: 0x1a0a00 }));
+      const face = new THREE.MeshStandardMaterial({ color: 0xffffff, map: this._texture(e.tex ?? e.img, e.name), metalness: 0.4, roughness: 0.5 });
+      const edge = new THREE.MeshStandardMaterial({ color: 0x4a3a20, metalness: 0.9, roughness: 0.4 });
+      mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, h, 28), [edge, face, face]);
       mesh.userData.height = h;
     } else if (e.kind === "currency") {
       const h = THREE.MathUtils.clamp(e.amount * 0.0012, 0.004, 0.09);
@@ -435,29 +525,34 @@ class ScaleView {
       mesh.userData.height = h;
     } else {
       const side = THREE.MathUtils.clamp(0.05 * Math.cbrt(e.kg / 0.2), 0.03, 0.17);
-      const tex = this._texture(e.img);
-      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, map: tex, roughness: 0.7 });
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, map: this._texture(e.img, e.name), roughness: 0.7 });
       mesh = new THREE.Mesh(new THREE.BoxGeometry(side, side, side), mat);
       mesh.userData.height = side;
     }
-    mesh.userData.baseEmissive = mesh.material.emissive?.getHex() ?? 0;
     return mesh;
   }
+
+  _materials(mesh) {
+    return [].concat(mesh.material);
+  }
+
+  /* ---------------- input ---------------- */
 
   _bindEvents() {
     const el = this.renderer.domElement;
     el.addEventListener("contextmenu", ev => ev.preventDefault());
     el.addEventListener("pointermove", ev => this._onMove(ev));
     el.addEventListener("pointerdown", ev => this._onDown(ev));
-    window.addEventListener("pointerup", this._up = () => this._cancelHold());
-    el.addEventListener("pointerleave", () => this._setHover(null));
-    el.addEventListener("dragover", ev => { if (this.canInteract()) ev.preventDefault(); });
+    el.addEventListener("pointerup", ev => this._onUp(ev));
+    el.addEventListener("pointercancel", ev => this._onUp(ev, true));
+    el.addEventListener("pointerleave", () => { if (!this.drag) this._setHover(null); });
+    el.addEventListener("dragover", ev => { if (this.hooks.canInteract()) ev.preventDefault(); });
     el.addEventListener("drop", ev => {
       ev.preventDefault();
-      if (!this.canInteract()) return;
+      if (!this.hooks.canInteract()) return;
       let data;
       try { data = JSON.parse(ev.dataTransfer.getData("text/plain")); } catch { return; }
-      this.onDrop(data, this._panAt(ev));
+      this.hooks.onDrop(data, this._panAt(ev) ?? this._nearestPan(ev));
     });
   }
 
@@ -469,60 +564,154 @@ class ScaleView {
 
   _entryAt(ev) {
     this._setPointer(ev);
-    const hit = this.raycaster.intersectObjects([...this.entryMeshes.values()], false)[0];
-    return hit?.object ?? null;
+    return this.raycaster.intersectObjects([...this.entryMeshes.values()], false)[0]?.object ?? null;
   }
 
+  /** Pan under the pointer (dish or its contents), ignoring the dragged mesh. */
   _panAt(ev) {
     this._setPointer(ev);
-    const hit = this.raycaster.intersectObjects([this.pans.left.dish, this.pans.right.dish, ...this.entryMeshes.values()], false)[0];
-    if (hit) {
-      let o = hit.object;
-      while (o && !o.userData.pan && o !== this.scene) o = o.parent;
-      if (o?.userData.pan) return o.userData.pan;
-      for (const side of ["left", "right"]) if (this.pans[side].content.children.includes(hit.object)) return side;
-    }
-    // nearest pan on screen
+    const targets = [this.pans.left.dish, this.pans.right.dish, ...[...this.entryMeshes.values()].filter(m => m !== this.drag?.mesh)];
+    const hit = this.raycaster.intersectObjects(targets, false)[0];
+    return hit?.object.userData.pan ?? null;
+  }
+
+  _nearestPan(ev) {
     const r = this.renderer.domElement.getBoundingClientRect();
     const dist = side => {
       const p = new THREE.Vector3(); this.pans[side].dish.getWorldPosition(p); p.project(this.camera);
-      const sx = (p.x + 1) / 2 * r.width + r.left, sy = (1 - p.y) / 2 * r.height + r.top;
-      return Math.hypot(sx - ev.clientX, sy - ev.clientY);
+      return Math.hypot((p.x + 1) / 2 * r.width + r.left - ev.clientX, (1 - p.y) / 2 * r.height + r.top - ev.clientY);
     };
     return dist("left") < dist("right") ? "left" : "right";
   }
 
   _setHover(mesh) {
     if (this.hovered === mesh) return;
-    if (this.hovered?.material?.emissive) this.hovered.material.emissive.setHex(this.hovered.userData.baseEmissive);
+    if (this.hovered) for (const m of this._materials(this.hovered)) m.emissive?.setHex(0x000000);
     this.hovered = mesh;
-    if (mesh?.material?.emissive) mesh.material.emissive.setHex(0x8a5a10);
-    this.renderer.domElement.style.cursor = mesh ? "pointer" : "";
+    if (mesh) for (const m of this._materials(mesh)) m.emissive?.setHex(0x8a5a10);
+    this.renderer.domElement.style.cursor = this.drag ? "grabbing" : mesh ? "grab" : "";
   }
 
   _onMove(ev) {
-    if (!this.canInteract()) return this._setHover(null);
+    if (this.drag) return this._dragTo(ev);
+    if (!this.hooks.canInteract()) return this._setHover(null);
     this._setHover(this._entryAt(ev));
   }
 
   _onDown(ev) {
-    if (ev.button !== 0 || !this.canInteract()) return;
+    if (ev.button !== 0 || !this.hooks.canInteract() || this.anims.length) return;
     const mesh = this._entryAt(ev);
     if (!mesh) return;
-    const entryId = mesh.userData.entryId;
-    this.hold = { mesh, start: performance.now(), done: false, timer: setTimeout(() => {
-      if (!this.hold) return;
-      this.hold.done = true;
-      this.onTake(entryId);
-      this.hold = null;
-    }, 450) };
+    ev.preventDefault();
+    this.renderer.domElement.setPointerCapture(ev.pointerId);
+    const home = { parent: mesh.parent, pos: mesh.position.clone(), quat: mesh.quaternion.clone() };
+    this.scene.attach(mesh);
+    const p = mesh.getWorldPosition(new THREE.Vector3());
+    const normal = this.camera.getWorldDirection(new THREE.Vector3()).negate();
+    this.drag = { mesh, home, plane: new THREE.Plane().setFromNormalAndCoplanarPoint(normal, p), last: p.clone(), vel: new THREE.Vector3(), t: performance.now() };
+    this._setHover(mesh);
+    this.renderer.domElement.style.cursor = "grabbing";
+    this.hooks.onDragState(false);
   }
 
-  _cancelHold() {
-    if (!this.hold) return;
-    clearTimeout(this.hold.timer);
-    this.hold.mesh.scale.setScalar(1);
-    this.hold = null;
+  _dragTo(ev) {
+    this._setPointer(ev);
+    const hit = new THREE.Vector3();
+    if (!this.raycaster.ray.intersectPlane(this.drag.plane, hit)) return;
+    hit.y = Math.max(hit.y, this.drag.mesh.userData.height / 2 + 0.002);
+    const now = performance.now(), dt = Math.max((now - this.drag.t) / 1000, 1e-3);
+    this.drag.vel.copy(hit).sub(this.drag.last).divideScalar(dt).clampLength(0, 3);
+    this.drag.last.copy(hit);
+    this.drag.t = now;
+    this.drag.mesh.position.copy(hit);
+    this.drag.mesh.rotation.x = THREE.MathUtils.clamp(this.drag.vel.z * 0.3, -0.5, 0.5);
+    this.drag.mesh.rotation.z = THREE.MathUtils.clamp(-this.drag.vel.x * 0.3, -0.5, 0.5);
+    this.hooks.onDragState(this.hooks.isOverInventory(ev.clientX, ev.clientY));
+  }
+
+  async _onUp(ev, cancelled = false) {
+    if (!this.drag) return;
+    const drag = this.drag;
+    const el = this.renderer.domElement;
+    if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
+    this.hooks.onDragState(null);
+    const entryId = drag.mesh.userData.entryId;
+    const fromPan = drag.mesh.userData.pan;
+
+    if (!cancelled && this.hooks.isOverInventory(ev.clientX, ev.clientY)) {
+      drag.mesh.visible = false;
+      this.drag = null;
+      const ok = await this.hooks.onTake(entryId);
+      if (!ok) { drag.mesh.visible = true; return this._returnHome(drag, false); }
+      return this._flush();
+    }
+    const pan = cancelled ? null : this._panAt(ev);
+    this.drag = null;
+    if (pan && pan !== fromPan) {
+      const ok = await this.hooks.onMove(entryId, pan);
+      if (ok) return this._flush();
+      return this._returnHome(drag, false);
+    }
+    // dropped on the same pan: settle back in place; dropped in the air: fall to the floor, then return
+    return this._returnHome(drag, !pan);
+  }
+
+  _flush() {
+    if (this.pendingState && !this.drag && !this.anims.length) this.update(this.pendingState);
+  }
+
+  /** Optionally drop the mesh to the floor under gravity, then glide it back to its slot in the pan. */
+  _returnHome(drag, fall) {
+    const mesh = drag.mesh;
+    const half = mesh.userData.height / 2;
+    const anim = { mesh, phase: fall ? "fall" : "return", vel: drag.vel.clone().multiplyScalar(0.4), bounces: 0, wait: 0 };
+    anim.vel.y = Math.min(anim.vel.y, 0.5);
+    anim.home = drag.home;
+    anim.start = null;
+    anim.half = half;
+    this.anims.push(anim);
+  }
+
+  _stepAnims(dt) {
+    for (const a of [...this.anims]) {
+      const m = a.mesh;
+      if (a.phase === "fall") {
+        a.vel.y -= GRAVITY * dt;
+        m.position.addScaledVector(a.vel, dt);
+        m.rotation.x += a.vel.z * dt * 4;
+        m.rotation.z -= a.vel.x * dt * 4;
+        // floor, or the pedestal top when it lands on it
+        const onPedestal = Math.abs(m.position.x) < 0.45 && Math.abs(m.position.z) < 0.25;
+        const ground = (onPedestal ? this.pedestalTop : 0) + a.half;
+        if (m.position.y <= ground) {
+          m.position.y = ground;
+          if (Math.abs(a.vel.y) > 0.6 && a.bounces < 2) { a.vel.y = -a.vel.y * 0.35; a.vel.x *= 0.6; a.vel.z *= 0.6; a.bounces++; }
+          else { a.phase = "rest"; a.wait = 0; m.rotation.set(0, m.rotation.y, 0); }
+        }
+      } else if (a.phase === "rest") {
+        a.wait += dt;
+        if (a.wait > 0.45) a.phase = "return";
+      } else if (a.phase === "return") {
+        if (!a.start) {
+          a.start = { pos: m.position.clone(), quat: m.quaternion.clone(), t: 0 };
+          a.target = a.home.parent.localToWorld(a.home.pos.clone());
+          a.targetQuat = a.home.parent.getWorldQuaternion(new THREE.Quaternion()).multiply(a.home.quat);
+        }
+        a.start.t = Math.min(a.start.t + dt / 0.45, 1);
+        const k = 1 - Math.pow(1 - a.start.t, 3);
+        const arc = Math.sin(Math.PI * a.start.t) * 0.12;
+        m.position.lerpVectors(a.start.pos, a.target, k);
+        m.position.y += arc;
+        m.quaternion.slerpQuaternions(a.start.quat, a.targetQuat, k);
+        if (a.start.t >= 1) {
+          a.home.parent.attach(m);
+          m.position.copy(a.home.pos);
+          m.quaternion.copy(a.home.quat);
+          this.anims.splice(this.anims.indexOf(a), 1);
+          this._flush();
+        }
+      }
+    }
   }
 
   resize() {
@@ -536,7 +725,6 @@ class ScaleView {
   _loop() {
     this.raf = requestAnimationFrame(this._loop);
     const dt = Math.min(this.clock.getDelta(), 0.05);
-    // spring toward the target tilt
     const k = 28, damp = 6.5;
     this.tiltVel += ((this.targetTilt - this.tilt) * k - this.tiltVel * damp) * dt;
     this.tilt += this.tiltVel * dt;
@@ -546,10 +734,7 @@ class ScaleView {
       this.beamEnds[side].getWorldPosition(p);
       this.pans[side].group.position.copy(p);
     }
-    if (this.hold) {
-      const t = Math.min((performance.now() - this.hold.start) / 450, 1);
-      this.hold.mesh.scale.setScalar(1 + 0.25 * t);
-    }
+    this._stepAnims(dt);
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
@@ -557,7 +742,6 @@ class ScaleView {
   destroy() {
     cancelAnimationFrame(this.raf);
     this.resizeObserver.disconnect();
-    window.removeEventListener("pointerup", this._up);
     this.controls.dispose();
     for (const t of this.textures.values()) t.dispose();
     this.scene.traverse(o => { o.geometry?.dispose(); if (o.material) [].concat(o.material).forEach(m => m.dispose()); });
@@ -570,7 +754,7 @@ class ScaleView {
 /*  Window                                      */
 /* -------------------------------------------- */
 
-const { ApplicationV2 } = foundry.applications.api;
+const { ApplicationV2, DialogV2 } = foundry.applications.api;
 
 class PuzzleWindow extends ApplicationV2 {
   static instances = new Map();
@@ -588,6 +772,7 @@ class PuzzleWindow extends ApplicationV2 {
     this.mode = mode; // "watch" | "interact"
   }
 
+  get def() { return PUZZLES[this.puzzleId]; }
   get state() { return getState(this.sceneDoc, this.puzzleId); }
   get isOperator() { return this.state.lock?.userId === game.user.id; }
 
@@ -600,6 +785,7 @@ class PuzzleWindow extends ApplicationV2 {
         <div class="tp-status"></div>
         <div class="tp-weights"></div>
         <div class="tp-controls"></div>
+        <div class="tp-dropzone"><i class="fa-solid fa-hand-holding"></i> Drop here to take it</div>
         <div class="tp-inventory"></div>
       </aside>`;
     return root;
@@ -613,13 +799,28 @@ class PuzzleWindow extends ApplicationV2 {
   _onFirstRender(context, options) {
     super._onFirstRender?.(context, options);
     const stage = this.element.querySelector(".tp-stage");
+    const side = this.element.querySelector(".tp-side");
     this.view = new ScaleView(stage, {
       canInteract: () => this.mode === "interact" && this.isOperator,
-      onTake: entryId => this._act("take", { entryId }),
-      onDrop: (data, pan) => this._drop(data, pan)
+      onTake: async entryId => !!(await this._act("take", { entryId }))?.ok,
+      onMove: async (entryId, pan) => !!(await this._act("move", { entryId, pan }))?.ok,
+      onDrop: (data, pan) => this._drop(data, pan),
+      isOverInventory: (x, y) => {
+        const r = side.getBoundingClientRect();
+        return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+      },
+      onDragState: over => {
+        this.element.classList.toggle("tp-dragging", over !== null);
+        this.element.classList.toggle("tp-drop-hover", !!over);
+      }
     });
-    if (this.mode === "interact") this.heartbeat = setInterval(() => request("heartbeat", this._payload()), HEARTBEAT_MS);
+    if (this.mode === "interact") this._startHeartbeat();
     this.refresh();
+  }
+
+  _startHeartbeat() {
+    clearInterval(this.heartbeat);
+    this.heartbeat = setInterval(() => request("heartbeat", this._payload()), HEARTBEAT_MS);
   }
 
   _payload(extra = {}) {
@@ -634,16 +835,15 @@ class PuzzleWindow extends ApplicationV2 {
 
   async _drop(data, pan) {
     if (data?.kind !== "item") return;
-    const actor = this._actor();
-    const item = actor?.items.get(data.itemId);
+    const item = this._actor()?.items.get(data.itemId);
     if (!item) return;
     let qty = 1;
     const have = Number(item.system.quantity ?? 1) || 1;
     if (have > 1) {
-      qty = await foundry.applications.api.DialogV2.prompt({
+      qty = await DialogV2.prompt({
         window: { title: item.name },
-        content: `<p>Quantas unidades colocar no prato? (você tem ${have})</p><input type="number" name="qty" min="1" max="${have}" value="1" autofocus>`,
-        ok: { label: "Colocar", callback: (ev, btn) => Number(btn.form.elements.qty.value) },
+        content: `<p>How many to place on the pan? (you have ${have})</p><input type="number" name="qty" min="1" max="${have}" value="1" autofocus>`,
+        ok: { label: "Place", callback: (ev, btn) => Number(btn.form.elements.qty.value) },
         rejectClose: false
       });
       if (!qty) return;
@@ -667,17 +867,18 @@ class PuzzleWindow extends ApplicationV2 {
     const operating = this.mode === "interact" && this.isOperator;
     el.classList.toggle("tp-watching", !operating);
     el.querySelector(".tp-hint").textContent = operating
-      ? "Botão direito: girar • Roda: zoom • Segure o clique esquerdo para retirar • Arraste itens para um prato"
-      : "Assistindo • Botão direito: girar • Roda: zoom";
+      ? "Drag objects with the left mouse button • Right-drag: orbit • Wheel: zoom • Drag items from the list onto a pan"
+      : "Watching • Right-drag: orbit • Wheel: zoom";
 
     const lock = state.lock;
+    const who = lock ? foundry.utils.escapeHTML(lock.actorName ?? lock.userName) : "";
     el.querySelector(".tp-status").innerHTML = lock
-      ? `<i class="fa-solid fa-hand"></i> <b>${foundry.utils.escapeHTML(lock.actorName ?? lock.userName)}</b> está interagindo${lock.userId === game.user.id ? " (você)" : ""}.`
-      : `<i class="fa-solid fa-eye"></i> Ninguém está interagindo.`;
+      ? `<i class="fa-solid fa-hand"></i> <b>${who}</b> is using the scale${lock.userId === game.user.id ? " (you)" : ""}.`
+      : `<i class="fa-solid fa-eye"></i> Nobody is using the scale.`;
 
-    const L = panKg(state.pans.left), R = panKg(state.pans.right);
     el.querySelector(".tp-weights").innerHTML =
-      `<div><span>Prato esquerdo</span><b>${fmtKg(L)}</b></div><div><span>Prato direito</span><b>${fmtKg(R)}</b></div>`;
+      `<div><span>Left pan</span><b>${fmtKg(panKg(state.pans.left))}</b></div>` +
+      `<div><span>Right pan</span><b>${fmtKg(panKg(state.pans.right))}</b></div>`;
 
     const controls = el.querySelector(".tp-controls");
     controls.innerHTML = "";
@@ -688,13 +889,13 @@ class PuzzleWindow extends ApplicationV2 {
       b.addEventListener("click", fn);
       controls.appendChild(b);
     };
-    if (operating) btn("Parar de interagir", "fa-hand-back-fist", () => this._stopInteracting());
-    else if (!lock || game.user.isGM) btn("Interagir", "fa-hand", () => this._startInteracting());
+    if (operating) btn("Stop interacting", "fa-hand-back-fist", () => this._stopInteracting());
+    else if (!lock || game.user.isGM) btn("Interact", "fa-hand", () => this._startInteracting());
     if (game.user.isGM) {
-      if (lock && !operating) btn("Liberar", "fa-unlock", () => this._act("release"));
-      btn("Resetar", "fa-rotate-left", async () => {
-        const ok = await foundry.applications.api.DialogV2.confirm({ window: { title: "Resetar balança" },
-          content: "<p>Voltar a balança ao estado inicial? Itens e moedas deixados nos pratos serão perdidos.</p>" });
+      if (lock && !operating) btn("Release", "fa-unlock", () => this._act("release"));
+      btn("Reset", "fa-rotate-left", async () => {
+        const ok = await DialogV2.confirm({ window: { title: "Reset scale" },
+          content: "<p>Return the scale to its starting state? Items and coins left on the pans will be lost.</p>" });
         if (ok) this._act("reset");
       });
     }
@@ -706,7 +907,7 @@ class PuzzleWindow extends ApplicationV2 {
     const box = this.element.querySelector(".tp-inventory");
     if (!operating) { box.innerHTML = ""; return; }
     const actor = this._actor();
-    if (!actor) { box.innerHTML = "<p>Personagem não encontrado.</p>"; return; }
+    if (!actor) { box.innerHTML = "<p>Character not found.</p>"; return; }
     const items = actor.items.filter(i => itemKgEach(i) > 0 && i.system.quantity !== 0)
       .sort((a, b) => a.name.localeCompare(b.name));
     const cur = actor.system.currency ?? {};
@@ -717,11 +918,11 @@ class PuzzleWindow extends ApplicationV2 {
         ${denoms.map(d => `<label class="tp-coin tp-${d}"><span>${CONFIG.DND5E.currencies[d].abbreviation ?? d}</span>
           <input type="number" min="0" max="${cur[d] ?? 0}" value="0" data-denom="${d}"><em>/ ${cur[d] ?? 0}</em></label>`).join("")}
         <div class="tp-coin-actions">
-          <button type="button" data-pan="left"><i class="fa-solid fa-coins"></i> Prato esquerdo</button>
-          <button type="button" data-pan="right"><i class="fa-solid fa-coins"></i> Prato direito</button>
+          <button type="button" data-pan="left"><i class="fa-solid fa-coins"></i> Left pan</button>
+          <button type="button" data-pan="right"><i class="fa-solid fa-coins"></i> Right pan</button>
         </div>
       </div>
-      <p class="tp-note">Arraste um item para um dos pratos (máx. ${PUZZLES[this.puzzleId].maxPanKg} kg por prato).</p>
+      <p class="tp-note">Drag an item onto a pan (max ${this.def.maxPanKg} kg per pan). Drag objects from the pans onto this panel to take them.</p>
       <ul class="tp-items">${items.map(i => `
         <li draggable="true" data-item-id="${i.id}">
           <img src="${i.img}"><span class="tp-name">${foundry.utils.escapeHTML(i.name)}</span>
@@ -740,12 +941,11 @@ class PuzzleWindow extends ApplicationV2 {
 
   async _startInteracting() {
     const tok = nearTokenFor(game.user, this.sceneDoc, this.puzzleId) ?? (game.user.isGM ? canvas.tokens.controlled[0]?.document : null);
-    if (!tok) return ui.notifications.warn(`Selecione um token seu a até ${PUZZLES[this.puzzleId].reachFt} ft da balança.`);
+    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${this.def.reachFt} ft of the scale.`);
     const r = await this._act("claim", { tokenUuid: tok.uuid });
     if (!r?.ok) return;
     this.mode = "interact";
-    clearInterval(this.heartbeat);
-    this.heartbeat = setInterval(() => request("heartbeat", this._payload()), HEARTBEAT_MS);
+    this._startHeartbeat();
     this.refresh();
   }
 
@@ -771,9 +971,9 @@ class PuzzleWindow extends ApplicationV2 {
 
 async function open(puzzleId) {
   const def = PUZZLES[puzzleId];
-  if (!def) return ui.notifications.error(`Theia Puzzles: puzzle "${puzzleId}" não existe.`);
+  if (!def) return ui.notifications.error(`Theia Puzzles: puzzle "${puzzleId}" doesn't exist.`);
   const scene = findPuzzleScene(puzzleId);
-  if (!scene) return ui.notifications.error("Theia Puzzles: nenhum tile de pedestal com esse puzzle.");
+  if (!scene) return ui.notifications.error("Theia Puzzles: no pedestal tile is linked to this puzzle.");
   const existing = PuzzleWindow.instances.get(puzzleId);
   if (existing?.rendered) return existing.bringToFront();
 
@@ -783,21 +983,21 @@ async function open(puzzleId) {
   const busy = lock && !stale && lock.userId !== game.user.id;
   const near = nearTokenFor(game.user, scene, puzzleId);
 
-  const buttons = [{ action: "watch", label: "Assistir", icon: "fa-solid fa-eye" }];
-  if (!busy || game.user.isGM) buttons.unshift({ action: "interact", label: "Interagir", icon: "fa-solid fa-hand", default: true });
-  buttons.push({ action: "cancel", label: "Cancelar", icon: "fa-solid fa-xmark" });
-  const why = busy ? `<p><b>${foundry.utils.escapeHTML(lock.actorName ?? lock.userName)}</b> já está interagindo com a balança. Você pode assistir.</p>`
-    : (!near && !game.user.isGM ? `<p>Para interagir, selecione seu token a até ${def.reachFt} ft da balança. Você pode assistir de qualquer lugar.</p>` : "");
-  const choice = await foundry.applications.api.DialogV2.wait({
+  const buttons = [{ action: "watch", label: "Watch", icon: "fa-solid fa-eye" }];
+  if (!busy || game.user.isGM) buttons.unshift({ action: "interact", label: "Interact", icon: "fa-solid fa-hand", default: true });
+  buttons.push({ action: "cancel", label: "Cancel", icon: "fa-solid fa-xmark" });
+  const why = busy ? `<p><b>${foundry.utils.escapeHTML(lock.actorName ?? lock.userName)}</b> is already using the scale. You can watch.</p>`
+    : (!near && !game.user.isGM ? `<p>To interact, select your token within ${def.reachFt} ft of the scale. You can watch from anywhere.</p>` : "");
+  const choice = await DialogV2.wait({
     window: { title: def.title, icon: "fa-solid fa-scale-balanced" },
-    content: `<p>Interagir com a balança?</p>${why}`, buttons, rejectClose: false
+    content: `<p>Interact with the scale?</p>${why}`, buttons, rejectClose: false
   });
   if (!choice || choice === "cancel") return;
 
   let mode = "watch";
   if (choice === "interact") {
     const tok = near ?? (game.user.isGM ? canvas.tokens.controlled[0]?.document : null);
-    if (!tok) return ui.notifications.warn(`Selecione um token seu a até ${def.reachFt} ft da balança.`);
+    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${def.reachFt} ft of the scale.`);
     const r = await request("claim", { puzzleId, sceneId: scene.id, tokenUuid: tok.uuid });
     if (!r?.ok) { if (r?.msg) ui.notifications.warn(r.msg); return; }
     mode = "interact";
@@ -829,19 +1029,14 @@ Hooks.once("ready", () => {
   });
 
   // GM: free the lock if its holder disconnects or goes silent.
-  Hooks.on("userConnected", (user, connected) => {
-    if (connected || !isActiveGM()) return;
-    for (const scene of game.scenes) for (const puzzleId of Object.keys(PUZZLES)) {
-      if (scene.getFlag(MODULE_ID, `state.${puzzleId}`)?.lock?.userId === user.id)
-        gmHandle({ type: "release", payload: { puzzleId, sceneId: scene.id }, userId: game.user.id });
-    }
-  });
-  setInterval(() => {
-    if (!isActiveGM()) return;
+  const sweep = (filter) => {
     for (const scene of game.scenes) for (const puzzleId of Object.keys(PUZZLES)) {
       const lock = scene.getFlag(MODULE_ID, `state.${puzzleId}`)?.lock;
-      if (lock && Date.now() - lock.ts > LOCK_TIMEOUT_MS)
-        gmHandle({ type: "release", payload: { puzzleId, sceneId: scene.id }, userId: game.user.id });
+      if (lock && filter(lock)) gmHandle({ type: "release", payload: { puzzleId, sceneId: scene.id }, userId: game.user.id });
     }
-  }, 30_000);
+  };
+  Hooks.on("userConnected", (user, connected) => {
+    if (!connected && isActiveGM()) sweep(lock => lock.userId === user.id);
+  });
+  setInterval(() => { if (isActiveGM()) sweep(lock => Date.now() - lock.ts > LOCK_TIMEOUT_MS); }, 30_000);
 });
