@@ -10,6 +10,7 @@
 //   from anywhere in the scene and follow it live.
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
+import { CONDITION_TYPES, PAN_OPTIONS, OPS, ACTION_TYPES, conditionsMet, runAction } from "./triggers.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -32,7 +33,22 @@ const PUZZLES = {
     soulItem: { uuid: "Item.3jaI1tQwMTsR1nA0", name: "Soul Coin" },
     // Face texture for the 3D coin (a copy on the Forge assets, which allow WebGL use).
     soulTexture: "https://assets.forge-vtt.com/63def5083cd17e6cc9b2ed99/Atlantis/Tiles/Puzzles/soul_coin.webp",
-    soulCount: 3
+    soulCount: 3,
+    // Default triggers; the GM edits them in the Triggers window (saved in the "triggers" world setting).
+    triggers: [{
+      id: "t2", name: "T2 — Poisoned payment", enabled: true, once: true,
+      conditions: [
+        { type: "souls", pan: "left", op: "eq", value: 0 },
+        { type: "weight", pan: "left", op: "lt", value: 0.55 }
+      ],
+      actions: [
+        { type: "closeWindow" },
+        { type: "trap", radius: 10, animation: "jb2a.bolt.poison.green", sound: "psfx.cantrips.poison-spray.v1",
+          ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
+          status: "poisoned", statusSeconds: 3600,
+          flavor: "Green gas bursts from the holes under the pedestal!" }
+      ]
+    }]
   }
 };
 
@@ -195,6 +211,8 @@ async function gmApply({ type, payload, userId }) {
     }
     case "reset": {
       if (!user.isGM) return { ok: false, msg: "Only the GM can reset the puzzle." };
+      // unset first: setFlag merges, which would keep keys like "fired" from the old state
+      await scene.unsetFlag(MODULE_ID, `state.${puzzleId}`);
       await scene.setFlag(MODULE_ID, `state.${puzzleId}`, initialState(def));
       return { ok: true };
     }
@@ -209,7 +227,7 @@ async function gmApply({ type, payload, userId }) {
   const panName = payload.pan === "left" ? "left" : "right";
   const pan = state.pans[panName];
 
-  switch (type) {
+  const result = await (async () => { switch (type) {
     case "placeItem": {
       const item = actor.items.get(payload.itemId);
       if (!item) return { ok: false, msg: "Item not found on the sheet." };
@@ -298,6 +316,51 @@ async function gmApply({ type, payload, userId }) {
     }
   }
   return { ok: false, msg: `Unknown action: ${type}` };
+  })();
+  if (result?.ok) await runTriggers(scene, puzzleId, { actor, tokenDoc, userId });
+  return result;
+}
+
+/* -------------------------------------------- */
+/*  Triggers                                    */
+/* -------------------------------------------- */
+
+function getTriggers(puzzleId) {
+  const saved = game.settings.get(MODULE_ID, "triggers")?.[puzzleId];
+  return foundry.utils.deepClone(saved ?? PUZZLES[puzzleId].triggers ?? []);
+}
+
+async function setTriggers(puzzleId, list) {
+  const all = foundry.utils.deepClone(game.settings.get(MODULE_ID, "triggers") ?? {});
+  all[puzzleId] = list;
+  await game.settings.set(MODULE_ID, "triggers", all);
+}
+
+function closeWindowsEverywhere(puzzleId) {
+  game.socket.emit(SOCKET, { type: "close", puzzleId });
+  PuzzleWindow.instances.get(puzzleId)?.close();
+}
+
+/** GM: after each change, fire every enabled trigger whose conditions now hold (once-only triggers fire once). */
+async function runTriggers(scene, puzzleId, { actor, tokenDoc, userId }) {
+  const def = PUZZLES[puzzleId];
+  const state = getState(scene, puzzleId);
+  const fired = new Set(state.fired ?? []);
+  const due = getTriggers(puzzleId).filter(t => t.enabled !== false && !(t.once && fired.has(t.id)) && conditionsMet(t, state, def));
+  if (!due.length) return;
+  for (const t of due) fired.add(t.id);
+  state.fired = [...fired];
+  await scene.setFlag(MODULE_ID, `state.${puzzleId}`, state);
+  const ctx = {
+    puzzleId, def, scene, state, actor, tokenDoc, userId, tile: findPedestal(scene, puzzleId),
+    distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId)
+  };
+  for (const t of due) {
+    Hooks.callAll(`${MODULE_ID}.trigger`, { trigger: t, ...ctx });
+    for (const action of t.actions ?? []) {
+      try { await runAction(action, ctx); } catch (err) { console.error(`${MODULE_ID} | trigger ${t.name}`, err); }
+    }
+  }
 }
 
 /* -------------------------------------------- */
@@ -893,6 +956,7 @@ class PuzzleWindow extends ApplicationV2 {
     else if (!lock || game.user.isGM) btn("Interact", "fa-hand", () => this._startInteracting());
     if (game.user.isGM) {
       if (lock && !operating) btn("Release", "fa-unlock", () => this._act("release"));
+      btn("Triggers", "fa-bolt", () => new TriggerEditor(this.puzzleId).render(true));
       btn("Reset", "fa-rotate-left", async () => {
         const ok = await DialogV2.confirm({ window: { title: "Reset scale" },
           content: "<p>Return the scale to its starting state? Items and coins left on the pans will be lost.</p>" });
@@ -966,6 +1030,139 @@ class PuzzleWindow extends ApplicationV2 {
 }
 
 /* -------------------------------------------- */
+/*  Trigger editor (GM)                         */
+/* -------------------------------------------- */
+
+class TriggerEditor extends ApplicationV2 {
+  static DEFAULT_OPTIONS = {
+    classes: ["theia-puzzle-triggers"],
+    window: { title: "Puzzle triggers", resizable: true, icon: "fa-solid fa-bolt" },
+    position: { width: 760, height: 700 }
+  };
+
+  constructor(puzzleId, options = {}) {
+    super({ id: `theia-puzzle-triggers`, ...options });
+    this.puzzleId = puzzleId;
+    this.list = getTriggers(puzzleId);
+  }
+
+  async _renderHTML() {
+    const esc = v => foundry.utils.escapeHTML(String(v ?? ""));
+    const opts = (map, cur) => Object.entries(map).map(([k, v]) =>
+      `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(typeof v === "string" ? v : v.label)}</option>`).join("");
+    const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args"];
+    const field = (key, val) => typeof val === "boolean"
+      ? `<label class="tpt-f"><span>${key}</span><input type="checkbox" data-k="${key}" ${val ? "checked" : ""}></label>`
+      : `<label class="tpt-f ${wide.includes(key) ? "tpt-wide" : ""}"><span>${key}</span><input type="${typeof val === "number" ? "number" : "text"}" step="any" data-k="${key}" value="${esc(val)}"></label>`;
+    const puzzles = opts(Object.fromEntries(Object.entries(PUZZLES).map(([k, d]) => [k, d.title])), this.puzzleId);
+    const has = (c, f) => CONDITION_TYPES[c.type]?.fields.includes(f);
+    const body = this.list.map((t, ti) => `
+      <section class="tpt-trigger" data-ti="${ti}">
+        <header>
+          <input class="tpt-name" type="text" value="${esc(t.name)}" placeholder="Trigger name">
+          <label><input type="checkbox" class="tpt-enabled" ${t.enabled !== false ? "checked" : ""}> enabled</label>
+          <label><input type="checkbox" class="tpt-once" ${t.once ? "checked" : ""}> once</label>
+          <button type="button" data-do="delTrigger" title="Delete trigger"><i class="fa-solid fa-trash"></i></button>
+        </header>
+        <h4>When all of these are true</h4>
+        ${(t.conditions ?? []).map((c, ci) => `
+          <div class="tpt-row tpt-cond" data-ci="${ci}">
+            <select data-k="type">${opts(CONDITION_TYPES, c.type)}</select>
+            ${has(c, "pan") ? `<select data-k="pan">${opts(PAN_OPTIONS, c.pan)}</select>` : ""}
+            ${has(c, "op") ? `<select data-k="op">${opts(OPS, c.op)}</select>` : ""}
+            ${has(c, "value") ? `<input type="number" step="any" data-k="value" value="${esc(c.value)}">` : ""}
+            ${has(c, "name") ? `<input type="text" data-k="name" placeholder="Item name" value="${esc(c.name)}">` : ""}
+            <button type="button" data-do="delCond" data-ci="${ci}"><i class="fa-solid fa-xmark"></i></button>
+          </div>`).join("")}
+        <button type="button" class="tpt-add" data-do="addCond"><i class="fa-solid fa-plus"></i> Condition</button>
+        <h4>Then do</h4>
+        ${(t.actions ?? []).map((a, ai) => `
+          <div class="tpt-row tpt-action" data-ai="${ai}">
+            <select data-k="type">${opts(ACTION_TYPES, a.type)}</select>
+            <button type="button" data-do="delAction" data-ai="${ai}"><i class="fa-solid fa-xmark"></i></button>
+            <div class="tpt-fields">${Object.keys(ACTION_TYPES[a.type]?.fields ?? {}).map(k => field(k, a[k] ?? ACTION_TYPES[a.type].fields[k])).join("")}</div>
+          </div>`).join("")}
+        <button type="button" class="tpt-add" data-do="addAction"><i class="fa-solid fa-plus"></i> Action</button>
+      </section>`).join("");
+    const root = document.createElement("div");
+    root.className = "tpt-root";
+    root.innerHTML = `
+      <div class="tpt-top"><label>Puzzle <select class="tpt-puzzle">${puzzles}</select></label>
+        <p class="tpt-help">Conditions are checked after every change on the scale. Weights are in kg. "Taken off the scale" counts Soul Coins removed from both pans.</p></div>
+      ${body || "<p>No triggers yet.</p>"}
+      <footer>
+        <button type="button" data-do="addTrigger"><i class="fa-solid fa-plus"></i> New trigger</button>
+        <button type="button" data-do="defaults"><i class="fa-solid fa-rotate-left"></i> Restore defaults</button>
+        <button type="button" data-do="save" class="tpt-save"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+      </footer>`;
+    return root;
+  }
+
+  _replaceHTML(result, content) {
+    content.replaceChildren(result);
+    content.querySelector(".tpt-puzzle").addEventListener("change", ev => {
+      this.puzzleId = ev.target.value;
+      this.list = getTriggers(this.puzzleId);
+      this.render();
+    });
+    content.querySelectorAll("select[data-k=type]").forEach(sel => sel.addEventListener("change", () => { this._read(); this.render(); }));
+    content.querySelectorAll("[data-do]").forEach(b => b.addEventListener("click", () => this._do(b)));
+  }
+
+  /** Pull the form values back into this.list. */
+  _read() {
+    const el = this.element;
+    if (!el) return;
+    el.querySelectorAll(".tpt-trigger").forEach(sec => {
+      const t = this.list[Number(sec.dataset.ti)];
+      t.name = sec.querySelector(".tpt-name").value;
+      t.enabled = sec.querySelector(".tpt-enabled").checked;
+      t.once = sec.querySelector(".tpt-once").checked;
+      sec.querySelectorAll(".tpt-cond").forEach(row => {
+        const c = t.conditions[Number(row.dataset.ci)];
+        row.querySelectorAll("[data-k]").forEach(inp => { c[inp.dataset.k] = inp.type === "number" ? Number(inp.value) : inp.value; });
+      });
+      sec.querySelectorAll(".tpt-action").forEach(row => {
+        const a = t.actions[Number(row.dataset.ai)];
+        const type = row.querySelector("select[data-k=type]").value;
+        if (type !== a.type) {
+          Object.keys(a).forEach(k => delete a[k]);
+          Object.assign(a, foundry.utils.deepClone(ACTION_TYPES[type].fields));
+          a.type = type;
+          return;
+        }
+        row.querySelectorAll(".tpt-fields [data-k]").forEach(inp => {
+          a[inp.dataset.k] = inp.type === "checkbox" ? inp.checked : inp.type === "number" ? Number(inp.value) : inp.value;
+        });
+      });
+    });
+  }
+
+  async _do(btn) {
+    this._read();
+    const sec = btn.closest(".tpt-trigger");
+    const t = sec ? this.list[Number(sec.dataset.ti)] : null;
+    switch (btn.dataset.do) {
+      case "addTrigger":
+        this.list.push({ id: foundry.utils.randomID(), name: "New trigger", enabled: true, once: true,
+          conditions: [{ type: "weight", pan: "left", op: "gte", value: 0 }], actions: [{ type: "chat", text: "", gmOnly: false }] });
+        break;
+      case "delTrigger": this.list.splice(Number(sec.dataset.ti), 1); break;
+      case "addCond": t.conditions.push({ type: "weight", pan: "left", op: "gte", value: 0 }); break;
+      case "delCond": t.conditions.splice(Number(btn.dataset.ci), 1); break;
+      case "addAction": t.actions.push({ type: "chat", ...foundry.utils.deepClone(ACTION_TYPES.chat.fields) }); break;
+      case "delAction": t.actions.splice(Number(btn.dataset.ai), 1); break;
+      case "defaults": this.list = foundry.utils.deepClone(PUZZLES[this.puzzleId].triggers ?? []); break;
+      case "save":
+        await setTriggers(this.puzzleId, this.list);
+        ui.notifications.info("Theia Puzzles: triggers saved.");
+        return;
+    }
+    this.render();
+  }
+}
+
+/* -------------------------------------------- */
 /*  Entry point                                 */
 /* -------------------------------------------- */
 
@@ -1008,7 +1205,16 @@ async function open(puzzleId) {
 }
 
 Hooks.once("init", () => {
-  game.modules.get(MODULE_ID).api = { open, PUZZLES, getState, request };
+  game.settings.register(MODULE_ID, "triggers", { scope: "world", config: false, type: Object, default: {} });
+  game.settings.registerMenu(MODULE_ID, "triggerMenu", {
+    name: "Puzzle triggers", label: "Edit triggers", icon: "fa-solid fa-bolt", restricted: true,
+    hint: "Conditions and actions (traps, rewards, macros...) for each puzzle.",
+    type: class extends TriggerEditor { constructor() { super(Object.keys(PUZZLES)[0]); } }
+  });
+  game.modules.get(MODULE_ID).api = {
+    open, PUZZLES, getState, request, getTriggers, setTriggers,
+    editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true)
+  };
 });
 
 Hooks.once("ready", () => {
@@ -1017,6 +1223,7 @@ Hooks.once("ready", () => {
       if (msg.to === game.user.id) pending[msg.rid]?.(msg.result);
       return;
     }
+    if (msg.type === "close") return PuzzleWindow.instances.get(msg.puzzleId)?.close();
     if (!isActiveGM()) return;
     const result = await gmHandle(msg);
     game.socket.emit(SOCKET, { type: "result", to: msg.userId, rid: msg.rid, result });
