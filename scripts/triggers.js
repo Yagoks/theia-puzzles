@@ -14,7 +14,7 @@ export const OPS = { lt: "<", lte: "≤", eq: "=", ne: "≠", gte: "≥", gt: ">
 export const ACTION_TYPES = {
   trap: {
     label: "Trap (area save + damage)",
-    fields: { radius: 10, animation: "", sound: "", ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
+    fields: { zones: "", radius: 10, animation: "", sound: "", ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
       status: "", statusSeconds: 3600, flavor: "" }
   },
   chat: { label: "Chat message", fields: { text: "", gmOnly: false } },
@@ -73,19 +73,57 @@ function tileCenter(tile) {
 }
 
 /** Area trap around the pedestal: animation + sound, one damage roll, a save per creature, half on success. */
+/** "x,y,w,h; x,y,w,h" (scene pixels) -> rectangles. */
+export function parseZones(text) {
+  return String(text ?? "").split(";").map(z => z.split(",").map(Number)).filter(z => z.length === 4 && z.every(Number.isFinite))
+    .map(([x, y, width, height]) => ({ x, y, width, height }));
+}
+
+/**
+ * Trap: with "zones" set, every creature whose space touches one of those rectangles is caught and the animation
+ * sweeps each zone row by row from its edge nearest the pedestal (like a line template); otherwise everyone within
+ * "radius" ft of the pedestal is caught and the animation streaks from the pedestal to each of them.
+ * One damage roll, a save per creature, half on success.
+ */
 export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
+  const zones = parseZones(action.zones);
+  const g = scene.grid.size;
+  const alive = t => t.actor && !t.hidden && (t.actor.system.attributes?.hp?.max ?? 0) > 0;
+  const touches = (t, z) => t.x < z.x + z.width - 1 && t.x + t.width * g > z.x + 1 && t.y < z.y + z.height - 1 && t.y + t.height * g > z.y + 1;
   const radius = Number(action.radius) || 10;
-  const targets = scene.tokens.filter(t => t.actor && !t.hidden && (t.actor.system.attributes?.hp?.max ?? 0) > 0
-    && distanceToPedestalFt(t, tile) <= radius + 0.01);
+  const targets = scene.tokens.filter(t => alive(t) && (zones.length
+    ? zones.some(z => touches(t, z))
+    : distanceToPedestalFt(t, tile) <= radius + 0.01));
   const origin = tileCenter(tile);
 
-  if (game.modules.get("sequencer")?.active) {
+  if (game.modules.get("sequencer")?.active && (action.animation || action.sound)) {
     const seq = new Sequence();
     if (action.sound) seq.sound().file(action.sound);
-    for (const t of targets) {
-      if (action.animation) seq.effect().file(action.animation).atLocation(origin).stretchTo(t.object ?? t).delay(Math.random() * 250);
+    if (action.animation && zones.length) {
+      for (const z of zones) {
+        // sweep away from the pedestal along the zone's long axis, one streak per grid row/column
+        const horizontal = Math.abs((z.x + z.width / 2) - origin.x) >= Math.abs((z.y + z.height / 2) - origin.y);
+        const lanes = Math.max(1, Math.round((horizontal ? z.height : z.width) / g));
+        for (let i = 0; i < lanes; i++) {
+          let from, to;
+          if (horizontal) {
+            const y = z.y + (i + 0.5) * (z.height / lanes);
+            const nearLeft = Math.abs(z.x - origin.x) < Math.abs(z.x + z.width - origin.x);
+            from = { x: nearLeft ? z.x : z.x + z.width, y };
+            to = { x: nearLeft ? z.x + z.width : z.x, y };
+          } else {
+            const x = z.x + (i + 0.5) * (z.width / lanes);
+            const nearTop = Math.abs(z.y - origin.y) < Math.abs(z.y + z.height - origin.y);
+            from = { x, y: nearTop ? z.y : z.y + z.height };
+            to = { x, y: nearTop ? z.y + z.height : z.y };
+          }
+          seq.effect().file(action.animation).atLocation(from).stretchTo(to).delay(i * 120);
+        }
+      }
+    } else if (action.animation) {
+      for (const t of targets) seq.effect().file(action.animation).atLocation(origin).stretchTo(t.object ?? t).delay(Math.random() * 250);
+      if (!targets.length) seq.effect().file(action.animation).atLocation(origin);
     }
-    if (!targets.length && action.animation) seq.effect().file(action.animation).atLocation(origin);
     seq.play();
   }
 

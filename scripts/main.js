@@ -43,7 +43,7 @@ const PUZZLES = {
       ],
       actions: [
         { type: "closeWindow" },
-        { type: "trap", radius: 10, animation: "jb2a.bolt.poison.green", sound: "psfx.cantrips.poison-spray.v1",
+        { type: "trap", zones: "7700,3300,200,200; 8000,3300,200,200", radius: 10, animation: "jb2a.bolt.poison.green", sound: "psfx.cantrips.poison-spray.v1",
           ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
           status: "poisoned", statusSeconds: 3600,
           flavor: "Green gas bursts from the holes under the pedestal!" }
