@@ -87,7 +87,7 @@ function soulEntry(def, data = null) {
 }
 
 function initialState(def) {
-  return { lock: null, pans: { left: Array.from({ length: def.soulCount ?? 0 }, () => soulEntry(def)), right: [] } };
+  return { epoch: foundry.utils.randomID(), lock: null, pans: { left: Array.from({ length: def.soulCount ?? 0 }, () => soulEntry(def)), right: [] } };
 }
 
 function getState(scene, puzzleId) {
@@ -181,6 +181,9 @@ async function gmApply({ type, payload, userId }) {
   const now = Date.now();
   const lockStale = state.lock && (now - state.lock.ts > LOCK_TIMEOUT_MS || !game.users.get(state.lock.userId)?.active);
   const holdsLock = state.lock?.userId === userId;
+  // Requests sent before a reset belong to the old puzzle: drop them.
+  if (type !== "reset" && type !== "release" && payload.epoch && state.epoch && payload.epoch !== state.epoch)
+    return { ok: false, msg: "The puzzle was reset." };
   const limitMsg = pan => `A pan holds at most ${def.maxPanKg} kg (it has ${fmtKg(panKg(pan))}).`;
 
   switch (type) {
@@ -214,6 +217,8 @@ async function gmApply({ type, payload, userId }) {
       // unset first: setFlag merges, which would keep keys like "fired" from the old state
       await scene.unsetFlag(MODULE_ID, `state.${puzzleId}`);
       await scene.setFlag(MODULE_ID, `state.${puzzleId}`, initialState(def));
+      // Close the scale for everyone: drags and dialogs in progress are abandoned.
+      closeWindowsEverywhere(puzzleId);
       return { ok: true };
     }
   }
@@ -930,7 +935,8 @@ class PuzzleWindow extends ApplicationV2 {
   }
 
   _payload(extra = {}) {
-    return { puzzleId: this.puzzleId, sceneId: this.sceneDoc.id, ...extra };
+    const epoch = getState(this.sceneDoc, this.puzzleId).epoch;
+    return { puzzleId: this.puzzleId, sceneId: this.sceneDoc.id, epoch, ...extra };
   }
 
   async _act(type, extra) {
@@ -943,6 +949,7 @@ class PuzzleWindow extends ApplicationV2 {
     if (data?.kind !== "item") return;
     const item = this._actor()?.items.get(data.itemId);
     if (!item) return;
+    const epoch = getState(this.sceneDoc, this.puzzleId).epoch;
     let qty = 1;
     const have = Number(item.system.quantity ?? 1) || 1;
     if (have > 1) {
@@ -952,9 +959,9 @@ class PuzzleWindow extends ApplicationV2 {
         ok: { label: "Place", callback: (ev, btn) => Number(btn.form.elements.qty.value) },
         rejectClose: false
       });
-      if (!qty) return;
+      if (!qty || !this.rendered) return;
     }
-    await this._act("placeItem", { itemId: item.id, qty, pan });
+    await this._act("placeItem", { itemId: item.id, qty, pan, epoch });
   }
 
   _actor() {
