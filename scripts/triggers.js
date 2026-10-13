@@ -103,7 +103,9 @@ export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
       for (const z of zones) {
         // sweep away from the pedestal along the zone's long axis, one streak per grid row/column
         const horizontal = Math.abs((z.x + z.width / 2) - origin.x) >= Math.abs((z.y + z.height / 2) - origin.y);
-        const lanes = Math.max(1, Math.round((horizontal ? z.height : z.width) / g));
+        // cone / breath animations: one per zone, from the edge nearest the pedestal; others: one streak per lane
+        const cone = /cone|breath/i.test(action.animation);
+        const lanes = cone ? 1 : Math.max(1, Math.round((horizontal ? z.height : z.width) / g));
         for (let i = 0; i < lanes; i++) {
           let from, to;
           if (horizontal) {
