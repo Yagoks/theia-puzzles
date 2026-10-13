@@ -201,6 +201,18 @@ function distanceToPedestalFt(tokenDoc, tile) {
   return (px / g) * gd;
 }
 
+/** The puzzle (id) this token is currently operating, if any. */
+function puzzleUsedBy(tokenDoc) {
+  const scene = tokenDoc.parent;
+  for (const puzzleId of Object.keys(PUZZLES)) {
+    const lock = scene?.getFlag(MODULE_ID, `state.${puzzleId}`)?.lock;
+    if (!lock || lock.tokenUuid !== tokenDoc.uuid) continue;
+    const stale = Date.now() - lock.ts > LOCK_TIMEOUT_MS || !game.users.get(lock.userId)?.active;
+    if (!stale) return puzzleId;
+  }
+  return null;
+}
+
 function nearTokenFor(user, scene, puzzleId) {
   if (!findPedestal(scene, puzzleId)) return null;
   const reach = getDef(puzzleId).reachFt;
@@ -1880,6 +1892,11 @@ Hooks.once("ready", () => {
       return;
     }
     if (msg.type === "close") return PuzzleWindow.instances.get(msg.puzzleId)?.close();
+    if (msg.type === "closeFor") {
+      if (msg.to !== game.user.id) return;
+      ui.notifications.info("You moved away from the puzzle.");
+      return PuzzleWindow.instances.get(msg.puzzleId)?.close();
+    }
     if (msg.type === "saveRequest") { if (msg.to === game.user.id) onSaveRequest(msg); return; }
     if (msg.type === "saveResult") { if (isActiveGM()) saveWaits[msg.rid]?.(msg.total); return; }
     if (!isActiveGM()) return;
@@ -1893,9 +1910,29 @@ Hooks.once("ready", () => {
   Hooks.on("preUpdateToken", (tokenDoc, changes) => {
     if (!("x" in changes || "y" in changes || "elevation" in changes)) return;
     const frozen = tokenDoc.parent?.getFlag(MODULE_ID, "frozen") ?? [];
-    if (!frozen.includes(tokenDoc.id)) return;
-    ui.notifications.warn(`${tokenDoc.name} is caught in the trap and can't move yet.`);
-    return false;
+    if (frozen.includes(tokenDoc.id)) {
+      ui.notifications.warn(`${tokenDoc.name} is caught in the trap and can't move yet.`);
+      return false;
+    }
+    // A character stays put while it operates a puzzle (the GM can still move it, which ends the operation).
+    const using = !game.user.isGM && puzzleUsedBy(tokenDoc);
+    if (using) {
+      ui.notifications.warn(`${tokenDoc.name} is using the ${getDef(using).noun ?? "scale"}. Stop interacting to move.`);
+      return false;
+    }
+  });
+
+  // GM: a lock holder moved out of reach (e.g. dragged by the GM) gives up the puzzle; its window closes.
+  Hooks.on("updateToken", (tokenDoc, changes) => {
+    if (!isActiveGM() || !("x" in changes || "y" in changes)) return;
+    const puzzleId = puzzleUsedBy(tokenDoc);
+    if (!puzzleId) return;
+    const def = getDef(puzzleId);
+    if (distanceToPuzzleFt(tokenDoc, tokenDoc.parent, puzzleId) <= def.reachFt + 0.01) return;
+    const lock = getState(tokenDoc.parent, puzzleId).lock;
+    gmHandle({ type: "release", payload: { puzzleId, sceneId: tokenDoc.parent.id }, userId: game.user.id });
+    if (lock.userId === game.user.id) PuzzleWindow.instances.get(puzzleId)?.close();
+    else game.socket.emit(SOCKET, { type: "closeFor", to: lock.userId, puzzleId });
   });
 
   // Live updates for every open window.
