@@ -27,5 +27,5 @@ A trigger fires when **all** its conditions hold after a change on the scale; "o
   chat message, give an item to the operator, run a macro, close the puzzle window.
 
 Default for L03 — *T2 Poisoned payment*: when the left pan has no Soul Coins and weighs < 0.55 kg, close the window and
-fire `jb2a.breath_weapons.poison.cone.green` (one cone per zone) across two 2x2 zones on either side of the pedestal + `psfx.cantrips.poison-spray.v1`: every creature in those zones makes a
+fire `jb2a.breath_weapons.poison.cone.dark_black` (one cone per zone) across two 2x2 zones on either side of the pedestal + `psfx.cantrips.poison-spray.v1`: every creature in those zones makes a
 DC 14 Constitution save, taking 2d6 poison (half on success) and Poisoned for 1 hour on a failure.

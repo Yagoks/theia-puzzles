@@ -43,7 +43,7 @@ const PUZZLES = {
       ],
       actions: [
         { type: "closeWindow" },
-        { type: "trap", zones: "7700,3300,200,200; 8000,3300,200,200", radius: 10, animation: "jb2a.breath_weapons.poison.cone.green", sound: "psfx.cantrips.poison-spray.v1",
+        { type: "trap", zones: "7700,3300,200,200; 8000,3300,200,200", radius: 10, animation: "jb2a.breath_weapons.poison.cone.dark_black", sound: "psfx.cantrips.poison-spray.v1",
           ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
           status: "poisoned", statusSeconds: 3600,
           flavor: "Green gas bursts from the holes under the pedestal!" }
@@ -1227,6 +1227,15 @@ Hooks.once("ready", () => {
     if (!isActiveGM()) return;
     const result = await gmHandle(msg);
     game.socket.emit(SOCKET, { type: "result", to: msg.userId, rid: msg.rid, result });
+  });
+
+  // Creatures caught by a trap can't move until it has been resolved (the GM clears the list afterwards).
+  Hooks.on("preUpdateToken", (tokenDoc, changes) => {
+    if (!("x" in changes || "y" in changes || "elevation" in changes)) return;
+    const frozen = tokenDoc.parent?.getFlag(MODULE_ID, "frozen") ?? [];
+    if (!frozen.includes(tokenDoc.id)) return;
+    ui.notifications.warn(`${tokenDoc.name} is caught in the trap and can't move yet.`);
+    return false;
   });
 
   // Live updates for every open window.

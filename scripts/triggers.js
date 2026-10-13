@@ -96,6 +96,13 @@ export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
     : distanceToPedestalFt(t, tile) <= radius + 0.01));
   const origin = tileCenter(tile);
 
+  // Hold the caught creatures in place until the trap has been resolved, so nobody steps out of the gas.
+  const frozenKey = "frozen";
+  const frozen = new Set(scene.getFlag("theia-puzzles", frozenKey) ?? []);
+  targets.forEach(t => frozen.add(t.id));
+  if (targets.length) await scene.setFlag("theia-puzzles", frozenKey, [...frozen]);
+  try {
+
   if (game.modules.get("sequencer")?.active && (action.animation || action.sound)) {
     const seq = new Sequence();
     if (action.sound) seq.sound().file(action.sound);
@@ -127,6 +134,7 @@ export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
       if (!targets.length) seq.effect().file(action.animation).atLocation(origin);
     }
     seq.play();
+    await new Promise(r => setTimeout(r, 1200)); // let the gas reach the creatures before the rolls
   }
 
   const speaker = { alias: action.speaker || "Trap" };
@@ -170,6 +178,12 @@ export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
     rows.push(`<li><b>${foundry.utils.escapeHTML(t.name)}</b>: ${saveTotal !== null ? `save ${saveTotal} — ${saved ? "success" : "failure"}, ` : ""}${dealt} damage${gotStatus ? `, ${game.i18n.localize(status.name)}` : ""}</li>`);
   }
   await ChatMessage.create({ speaker, content: `<p><em>${action.flavor || "The trap goes off."}</em></p><ul>${rows.join("")}</ul>` });
+  } finally {
+    if (targets.length) {
+      const left = (scene.getFlag("theia-puzzles", frozenKey) ?? []).filter(id => !targets.some(t => t.id === id));
+      await scene.setFlag("theia-puzzles", frozenKey, left);
+    }
+  }
 }
 
 export async function runAction(action, ctx) {
