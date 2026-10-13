@@ -9,12 +9,18 @@ export const CONDITION_TYPES = {
 };
 
 export const PAN_OPTIONS = { left: "Left pan", right: "Right pan", any: "Both pans", removed: "Taken off the scale" };
+export const ROLL_MODES = {
+  auto: "GM rolls every save automatically",
+  players: "Players roll their own (Theia window); GM rolls the rest",
+  epic: "Epic Rolls: one shared roll for everyone caught"
+};
+
 export const OPS = { lt: "<", lte: "≤", eq: "=", ne: "≠", gte: "≥", gt: ">" };
 
 export const ACTION_TYPES = {
   trap: {
     label: "Trap (area save + damage)",
-    fields: { zones: "", radius: 10, animation: "", sound: "", ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
+    fields: { zones: "", radius: 10, rollMode: "auto", rollTimeout: 30, animation: "", sound: "", ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
       status: "", statusSeconds: 3600, flavor: "" }
   },
   chat: { label: "Chat message", fields: { text: "", gmOnly: false } },
@@ -73,6 +79,60 @@ function tileCenter(tile) {
 }
 
 /** Area trap around the pedestal: animation + sound, one damage roll, a save per creature, half on success. */
+function saveFlavor(action) {
+  return `${CONFIG.DND5E.abilities[action.ability]?.label ?? action.ability} save DC ${action.dc} — ${action.flavor || "trap"}`;
+}
+
+/** GM rolls one save itself. */
+async function gmSave(action, actor) {
+  const rolls = await actor.rollSavingThrow({ ability: action.ability, target: Number(action.dc) },
+    { configure: false }, { data: { flavor: saveFlavor(action) } });
+  const roll = Array.isArray(rolls) ? rolls[0] : rolls;
+  return roll?.total ?? 0;
+}
+
+/** The connected non-GM player who should roll for this actor (its assigned character first). */
+export function playerFor(actor) {
+  const players = game.users.filter(u => u.active && !u.isGM && actor.testUserPermission(u, "OWNER"));
+  return players.find(u => u.character?.id === (actor.isToken ? actor.token?.actorId : actor.id)) ?? players[0] ?? null;
+}
+
+/**
+ * Roll the saves for everyone caught, according to action.rollMode. Returns Map tokenId -> total.
+ * - auto: the GM rolls every save.
+ * - players: each owning player gets a Theia window to roll their own; NPCs (and anyone who doesn't answer
+ *   within rollTimeout seconds) are rolled by the GM.
+ * - epic: one Epic Rolls 5e request for everyone; missing results are rolled by the GM.
+ */
+async function rollSaves(action, targets, ctx) {
+  const out = new Map();
+  const mode = action.rollMode || "auto";
+  const timeoutMs = Math.max(5, Number(action.rollTimeout) || 30) * 1000;
+
+  if (mode === "epic" && game.modules.get("epic-rolls-5e")?.active && ui.EpicRolls5e?.requestRoll) {
+    try {
+      const res = await ui.EpicRolls5e.requestRoll({
+        actors: targets.map(t => t.actor.uuid), contestants: [], type: `save.${action.ability}`, contest: null,
+        options: { DC: Number(action.dc) }
+      });
+      for (const r of res?.results ?? []) {
+        const t = targets.find(t => t.actor.uuid === r.actor?.uuid || t.actor === r.actor);
+        const total = r.roll?.total ?? (typeof r.value === "number" ? r.value : null);
+        if (t && total !== null && total !== undefined) out.set(t.id, total);
+      }
+    } catch (err) { console.error("theia-puzzles | Epic Rolls", err); }
+  } else if (mode === "players") {
+    await Promise.all(targets.map(async t => {
+      const user = playerFor(t.actor);
+      if (!user) return;
+      const total = await ctx.askPlayerSave(user, t, { ability: action.ability, dc: Number(action.dc), flavor: saveFlavor(action), timeoutMs });
+      if (typeof total === "number") out.set(t.id, total);
+    }));
+  }
+  for (const t of targets) if (!out.has(t.id)) out.set(t.id, await gmSave(action, t.actor));
+  return out;
+}
+
 /** "x,y,w,h; x,y,w,h" (scene pixels) -> rectangles. */
 export function parseZones(text) {
   return String(text ?? "").split(";").map(z => z.split(",").map(Number)).filter(z => z.length === 4 && z.every(Number.isFinite))
@@ -85,7 +145,8 @@ export function parseZones(text) {
  * "radius" ft of the pedestal is caught and the animation streaks from the pedestal to each of them.
  * One damage roll, a save per creature, half on success.
  */
-export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
+export async function runTrap(action, ctx) {
+  const { scene, tile, distanceToPedestalFt } = ctx;
   const zones = parseZones(action.zones);
   const g = scene.grid.size;
   const alive = t => t.actor && !t.hidden && (t.actor.system.attributes?.hp?.max ?? 0) > 0;
@@ -148,16 +209,11 @@ export async function runTrap(action, { scene, tile, distanceToPedestalFt }) {
 
   const rows = [];
   const status = action.status ? CONFIG.statusEffects.find(s => s.id === action.status) : null;
+  const saves = (action.ability && action.dc) ? await rollSaves(action, targets, ctx) : new Map();
   for (const t of targets) {
     const actor = t.actor;
-    let saveTotal = null, saved = false;
-    if (action.ability && action.dc) {
-      const rolls = await actor.rollSavingThrow({ ability: action.ability, target: Number(action.dc) },
-        { configure: false }, { data: { flavor: `${CONFIG.DND5E.abilities[action.ability]?.label ?? action.ability} save DC ${action.dc} — ${action.flavor || "trap"}` } });
-      const roll = Array.isArray(rolls) ? rolls[0] : rolls;
-      saveTotal = roll?.total ?? 0;
-      saved = saveTotal >= Number(action.dc);
-    }
+    const saveTotal = saves.has(t.id) ? saves.get(t.id) : null;
+    const saved = saveTotal !== null && saveTotal >= Number(action.dc);
     let dealt = 0;
     if (dmgRoll) {
       dealt = saved ? (action.half ? Math.floor(dmgRoll.total / 2) : 0) : dmgRoll.total;

@@ -190,3 +190,7 @@
 .theia-puzzle-triggers .tpt-add { width: auto; font-size: 12px; }
 .theia-puzzle-triggers footer { display: flex; gap: 8px; position: sticky; bottom: 0; padding: 6px 0; background: inherit; }
 .theia-puzzle-triggers footer .tpt-save { margin-left: auto; }
+
+/* Player save request window */
+.theia-puzzle-save .tp-save-flavor { opacity: 0.85; }
+.theia-puzzle-save .tp-save-timer { font-size: 12px; opacity: 0.7; }

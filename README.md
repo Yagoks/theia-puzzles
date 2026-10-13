@@ -29,3 +29,11 @@ A trigger fires when **all** its conditions hold after a change on the scale; "o
 Default for L03 — *T2 Poisoned payment*: when the left pan has no Soul Coins and weighs < 0.55 kg, close the window and
 fire `jb2a.breath_weapons.poison.cone.dark_black` (one cone per zone) across two 2x2 zones on either side of the pedestal + `psfx.cantrips.poison-spray.v1`: every creature in those zones makes a
 DC 14 Constitution save, taking 2d6 poison (half on success) and Poisoned for 1 hour on a failure.
+
+### Who rolls the saves (trap `rollMode`)
+
+- `auto` — the GM rolls every save.
+- `players` — each connected owner gets a Theia window with a **Roll save** button; NPCs, and anyone who doesn't roll within `rollTimeout` seconds, are rolled by the GM.
+- `epic` — a single Epic Rolls 5e request for everyone caught (requires the *Epic Rolls 5e* module); missing results are rolled by the GM.
+
+Creatures caught in the trap can't move until it is resolved.

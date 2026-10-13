@@ -10,7 +10,7 @@
 //   from anywhere in the scene and follow it live.
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
-import { CONDITION_TYPES, PAN_OPTIONS, OPS, ACTION_TYPES, conditionsMet, runAction } from "./triggers.js";
+import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, conditionsMet, runAction } from "./triggers.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -43,7 +43,7 @@ const PUZZLES = {
       ],
       actions: [
         { type: "closeWindow" },
-        { type: "trap", zones: "7700,3300,200,200; 8000,3300,200,200", radius: 10, animation: "jb2a.breath_weapons.poison.cone.dark_black", sound: "psfx.cantrips.poison-spray.v1",
+        { type: "trap", zones: "7700,3300,200,200; 8000,3300,200,200", radius: 10, rollMode: "players", rollTimeout: 30, animation: "jb2a.breath_weapons.poison.cone.dark_black", sound: "psfx.cantrips.poison-spray.v1",
           ability: "con", dc: 14, damage: "2d6", damageType: "poison", half: true,
           status: "poisoned", statusSeconds: 3600,
           flavor: "Green gas bursts from the holes under the pedestal!" }
@@ -336,6 +336,49 @@ async function setTriggers(puzzleId, list) {
   await game.settings.set(MODULE_ID, "triggers", all);
 }
 
+/** GM: ask a player to roll a save from their own client. Resolves with the total, or null on timeout. */
+const saveWaits = {};
+function askPlayerSave(user, tokenDoc, { ability, dc, flavor, timeoutMs }) {
+  const rid = foundry.utils.randomID();
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { delete saveWaits[rid]; resolve(null); }, timeoutMs);
+    saveWaits[rid] = total => { clearTimeout(timer); delete saveWaits[rid]; resolve(total); };
+    game.socket.emit(SOCKET, { type: "saveRequest", to: user.id, rid, actorUuid: tokenDoc.actor.uuid, tokenName: tokenDoc.name,
+      ability, dc, flavor, timeoutMs });
+  });
+}
+
+/** Player: show the save window, roll it on click, send the total back to the GM. */
+async function onSaveRequest(msg) {
+  const actor = fromUuidSync(msg.actorUuid);
+  if (!actor) return;
+  const label = CONFIG.DND5E.abilities[msg.ability]?.label ?? msg.ability;
+  let answered = false;
+  const send = total => {
+    if (answered) return;
+    answered = true;
+    game.socket.emit(SOCKET, { type: "saveResult", rid: msg.rid, total });
+  };
+  const dlg = new DialogV2({
+    window: { title: "Saving throw!", icon: "fa-solid fa-skull-crossbones" },
+    classes: ["theia-puzzle-save"],
+    content: `<p><b>${foundry.utils.escapeHTML(msg.tokenName)}</b> must make a <b>${label} saving throw (DC ${msg.dc})</b>.</p>
+      <p class="tp-save-flavor"><em>${foundry.utils.escapeHTML(msg.flavor ?? "")}</em></p>
+      <p class="tp-save-timer">If you don't roll in ${Math.round(msg.timeoutMs / 1000)} s, the GM rolls for you.</p>`,
+    buttons: [{
+      action: "roll", label: `Roll ${label} save`, icon: "fa-solid fa-dice-d20", default: true,
+      callback: async () => {
+        const rolls = await actor.rollSavingThrow({ ability: msg.ability, target: msg.dc }, {}, { data: { flavor: msg.flavor } });
+        const roll = Array.isArray(rolls) ? rolls[0] : rolls;
+        if (roll) send(roll.total);
+      }
+    }],
+    rejectClose: false
+  });
+  dlg.render(true);
+  setTimeout(() => { if (!answered) { answered = true; dlg.close(); } }, msg.timeoutMs - 500);
+}
+
 function closeWindowsEverywhere(puzzleId) {
   game.socket.emit(SOCKET, { type: "close", puzzleId });
   PuzzleWindow.instances.get(puzzleId)?.close();
@@ -353,7 +396,7 @@ async function runTriggers(scene, puzzleId, { actor, tokenDoc, userId }) {
   await scene.setFlag(MODULE_ID, `state.${puzzleId}`, state);
   const ctx = {
     puzzleId, def, scene, state, actor, tokenDoc, userId, tile: findPedestal(scene, puzzleId),
-    distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId)
+    distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId), askPlayerSave
   };
   for (const t of due) {
     Hooks.callAll(`${MODULE_ID}.trigger`, { trigger: t, ...ctx });
@@ -1051,7 +1094,9 @@ class TriggerEditor extends ApplicationV2 {
     const opts = (map, cur) => Object.entries(map).map(([k, v]) =>
       `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(typeof v === "string" ? v : v.label)}</option>`).join("");
     const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args"];
-    const field = (key, val) => typeof val === "boolean"
+    const field = (key, val) => key === "rollMode"
+      ? `<label class="tpt-f tpt-wide"><span>${key}</span><select data-k="${key}">${opts(ROLL_MODES, val)}</select></label>`
+      : typeof val === "boolean"
       ? `<label class="tpt-f"><span>${key}</span><input type="checkbox" data-k="${key}" ${val ? "checked" : ""}></label>`
       : `<label class="tpt-f ${wide.includes(key) ? "tpt-wide" : ""}"><span>${key}</span><input type="${typeof val === "number" ? "number" : "text"}" step="any" data-k="${key}" value="${esc(val)}"></label>`;
     const puzzles = opts(Object.fromEntries(Object.entries(PUZZLES).map(([k, d]) => [k, d.title])), this.puzzleId);
@@ -1224,6 +1269,8 @@ Hooks.once("ready", () => {
       return;
     }
     if (msg.type === "close") return PuzzleWindow.instances.get(msg.puzzleId)?.close();
+    if (msg.type === "saveRequest") { if (msg.to === game.user.id) onSaveRequest(msg); return; }
+    if (msg.type === "saveResult") { if (isActiveGM()) saveWaits[msg.rid]?.(msg.total); return; }
     if (!isActiveGM()) return;
     const result = await gmHandle(msg);
     game.socket.emit(SOCKET, { type: "result", to: msg.userId, rid: msg.rid, result });
