@@ -37,3 +37,23 @@ DC 14 Constitution save, taking 2d6 poison (half on success) and Poisoned for 1 
 - `epic` — a single Epic Rolls 5e request for everyone caught (requires the *Epic Rolls 5e* module); missing results are rolled by the GM.
 
 Creatures caught in the trap can't move until it is resolved.
+
+
+## Slot tables (`type: "slots"`)
+
+A table with a row of sockets. Each socket has a plaque, a shape (cube, pyramid, circle, cylinder, dodecahedron,
+plate) and the piece it accepts. A piece is any item with `flags.theia-puzzles.key`. Pieces dragged in from the
+character's list take the shape of their socket. Edit everything in **Setup** (GM button in the puzzle window).
+
+- **Verify:** automatic (solved when every socket holds its piece), a button in the window, or external through
+  `game.modules.get("theia-puzzles").api.press(puzzleId, { tokenUuid, tileUuid })` (e.g. a Monk's Active Tiles lever).
+- **Wrong combination** (pressed with every socket filled): sound, public and GM messages, sockets locked for N seconds.
+  With a socket empty nothing happens.
+- **Only original pieces:** when an *Unboxing the Mystery* tile hands out a piece, the GM marks that item with a unique
+  id (world setting `instances`). Copies from the Items directory or renamed items don't fit. Setup has a button to
+  record pieces handed out another way.
+- **Triggers:** conditions `solved`, `released` (emptied after being solved), `filled`, `correct`; actions `door`
+  (wall ids → open / closed / locked) and `sound` (file path or Sequencer key). Non-"once" triggers fire each time their
+  conditions become true.
+
+Several tiles can open the same puzzle (flag `theia-puzzles.puzzle` on each); reach is measured to the nearest one.

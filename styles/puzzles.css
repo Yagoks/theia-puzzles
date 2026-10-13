@@ -194,3 +194,13 @@
 /* Player save request window */
 .theia-puzzle-save .tp-save-flavor { opacity: 0.85; }
 .theia-puzzle-save .tp-save-timer { font-size: 12px; opacity: 0.7; }
+
+/* Slot tables */
+.theia-puzzle .tp-weights .tp-expects { flex-basis: 100%; font-size: 11px; opacity: 0.7; text-align: right; }
+.theia-puzzle .tp-weights > div { flex-wrap: wrap; }
+.theia-puzzle .tp-stuck { margin: 6px 0 0; color: #e07a5f; font-weight: bold; }
+.theia-puzzle .tp-solved { margin: 6px 0 0; color: #7bc96f; font-weight: bold; }
+.theia-puzzle-slots .tps-slot { display: grid; grid-template-columns: 1fr 140px 180px auto; gap: 6px; align-items: center; }
+.theia-puzzle-slots .tps-registry { margin: 4px 0 8px; padding-left: 18px; font-size: 12px; }
+.theia-puzzle-slots .tps-registry code { font-size: 10px; opacity: 0.6; }
+.theia-puzzle-slots .tps-slot input[type="text"] { width: 100%; }

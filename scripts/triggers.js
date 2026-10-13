@@ -5,8 +5,15 @@ export const CONDITION_TYPES = {
   souls: { label: "Soul Coins in", fields: ["pan", "op", "value"] },
   weight: { label: "Weight (kg) in", fields: ["pan", "op", "value"] },
   difference: { label: "Left − right weight (kg)", fields: ["op", "value"] },
-  hasItem: { label: "Item on", fields: ["pan", "name"] }
+  hasItem: { label: "Item on", fields: ["pan", "name"] },
+  // slot tables
+  solved: { label: "Solved (1 = yes, 0 = no)", fields: ["op", "value"] },
+  released: { label: "Emptied after being solved (1 = yes)", fields: ["op", "value"] },
+  filled: { label: "Slots filled", fields: ["op", "value"] },
+  correct: { label: "Slots with the right piece", fields: ["op", "value"] }
 };
+
+export const DOOR_STATES = { open: "Unlocked and open", closed: "Closed (unlocked)", locked: "Closed and locked" };
 
 export const PAN_OPTIONS = { left: "Left pan", right: "Right pan", any: "Both pans", removed: "Taken off the scale" };
 export const ROLL_MODES = {
@@ -26,7 +33,9 @@ export const ACTION_TYPES = {
   chat: { label: "Chat message", fields: { text: "", gmOnly: false } },
   giveItem: { label: "Give item to the operator", fields: { uuid: "", quantity: 1, text: "" } },
   macro: { label: "Run macro", fields: { name: "", args: "" } },
-  closeWindow: { label: "Close the puzzle window", fields: {} }
+  closeWindow: { label: "Close the puzzle window", fields: {} },
+  door: { label: "Set doors (wall ids)", fields: { walls: "", state: "open" } },
+  sound: { label: "Play a sound for everyone", fields: { src: "", volume: 0.8 } }
 };
 
 const TOL = 0.005;
@@ -49,7 +58,10 @@ const kgOf = list => (list ?? []).reduce((s, e) => s + (e.kg ?? 0), 0);
 export function conditionsMet(trigger, state, def) {
   const conds = trigger.conditions ?? [];
   if (!conds.length) return false;
-  const pans = state.pans;
+  const pans = state.pans ?? { left: [], right: [] };
+  const slotList = def.slots ?? [];
+  const filled = slotList.filter(s => state.slots?.[s.id]).length;
+  const correct = slotList.filter(s => state.slots?.[s.id]?.key && state.slots[s.id].key === s.accepts).length;
   const listOf = pan => pan === "any" ? [...pans.left, ...pans.right] : pans[pan] ?? [];
   return conds.every(c => {
     const value = Number(c.value) || 0;
@@ -61,6 +73,10 @@ export function conditionsMet(trigger, state, def) {
       }
       case "weight": return compare(kgOf(listOf(c.pan)), c.op, value);
       case "difference": return compare(kgOf(pans.left) - kgOf(pans.right), c.op, value);
+      case "solved": return compare(state.solved ? 1 : 0, c.op, value);
+      case "released": return compare(state.released ? 1 : 0, c.op, value);
+      case "filled": return compare(filled, c.op, value);
+      case "correct": return compare(correct, c.op, value);
       case "hasItem": {
         const name = String(c.name ?? "").trim().toLowerCase();
         return !!name && listOf(c.pan).some(e => String(e.name ?? "").toLowerCase() === name);
@@ -242,6 +258,14 @@ export async function runTrap(action, ctx) {
   }
 }
 
+/** Play a sound for everyone: a file path, or a Sequencer database key (e.g. "psfx.doors.clean.lock.wooden.01"). */
+export function playSound(src, volume = 0.8) {
+  if (!src) return;
+  const vol = Number(volume) || 0.8;
+  if (!src.includes("/") && game.modules.get("sequencer")?.active) return new Sequence().sound().file(src).volume(vol).play();
+  return foundry.audio.AudioHelper.play({ src, volume: vol, autoplay: true, loop: false }, true);
+}
+
 export async function runAction(action, ctx) {
   switch (action.type) {
     case "trap": return runTrap(action, ctx);
@@ -265,5 +289,12 @@ export async function runAction(action, ctx) {
     }
     case "closeWindow":
       return ctx.closeWindows();
+    case "door": {
+      const ds = { open: CONST.WALL_DOOR_STATES.OPEN, closed: CONST.WALL_DOOR_STATES.CLOSED, locked: CONST.WALL_DOOR_STATES.LOCKED }[action.state];
+      const ids = String(action.walls ?? "").split(/[\s,;]+/).filter(id => ctx.scene.walls.has(id));
+      if (ds === undefined || !ids.length) return;
+      return ctx.scene.updateEmbeddedDocuments("Wall", ids.map(_id => ({ _id, ds })));
+    }
+    case "sound": return playSound(action.src, action.volume);
   }
 }

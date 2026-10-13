@@ -8,9 +8,11 @@
 //   validates (lock owner, distance, weights) and applies them one at a time.
 // - One operator at a time ("Interact", must stand within reach of the pedestal); anyone can "Watch"
 //   from anywhere in the scene and follow it live.
+// - Puzzle types: "scale" (weigh items and coins on two pans) and "slots" (a table of sockets that take specific
+//   pieces; solved automatically, by a button, or from outside through api.press(), e.g. a Monk's Active Tiles lever).
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
-import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, conditionsMet, runAction } from "./triggers.js";
+import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -49,8 +51,77 @@ const PUZZLES = {
           flavor: "Green gas bursts from the holes under the pedestal!" }
       ]
     }]
+  },
+
+  "l22-selos": {
+    type: "slots",
+    title: "Table of the Three Seals",
+    noun: "table",
+    icon: "fa-table-cells",
+    reachFt: 5,
+    // Each slot: the label on its plaque, the shape of its socket, and the piece it takes (flags.theia-puzzles.key).
+    slots: [
+      { id: "nome", label: "Nome", shape: "cube", accepts: "mask" },
+      { id: "valor", label: "Valor", shape: "cube", accepts: "hands" },
+      { id: "testemunha", label: "Testemunha", shape: "cube", accepts: "eye" }
+    ],
+    // auto: solved as soon as every slot holds its piece • button: "Press" in the window • external: api.press()
+    verify: "external",
+    // Only pieces actually looted in the dungeon fit (copies made from the Items directory or renamed items don't).
+    requireOriginal: true,
+    pressSound: "psfx.doors.clean.lock.unlock.wooden.01",
+    wrongLockSeconds: 60,
+    wrongSound: "psfx.cantrips.toll-the-dead.ominous-bell.001",
+    wrongText: "The three slots lock in place with a dry clack. Somewhere in the vault, a bell rings.",
+    wrongGmText: "T9 — wrong combination: the bell rings in L11 (alert +1). The slots stay locked for a minute.",
+    triggers: [
+      {
+        id: "open", name: "Seals accepted — the vault door opens", enabled: true, once: false,
+        conditions: [{ type: "solved", op: "eq", value: 1 }],
+        actions: [
+          { type: "door", walls: "VjGwtRf63MIDvmy9", state: "open" },
+          { type: "door", walls: "2IOCQojUCCfwrq1z", state: "locked" },
+          { type: "chat", text: "<p><em>The three seals sink into the table with a heavy clunk. Ahead, a bolt slides free; behind you, the doors slam shut.</em></p>", gmOnly: false }
+        ]
+      },
+      {
+        id: "close", name: "Seals removed — back to the start", enabled: true, once: false,
+        conditions: [{ type: "released", op: "eq", value: 1 }],
+        actions: [
+          { type: "door", walls: "VjGwtRf63MIDvmy9", state: "locked" },
+          { type: "door", walls: "2IOCQojUCCfwrq1z", state: "open" },
+          { type: "chat", text: "<p><em>With the last seal lifted, the vault door grinds shut and the way back opens again.</em></p>", gmOnly: false }
+        ]
+      }
+    ]
   }
 };
+
+/** Socket / piece shapes of slot tables. */
+const SHAPES = { cube: "Cube", pyramid: "Pyramid", circle: "Circle (disc)", cylinder: "Cylinder", dodecahedron: "Dodecahedron", plate: "Plate" };
+const VERIFY_MODES = {
+  auto: "Automatic — solved when every slot holds its piece",
+  button: "Button in the puzzle window",
+  external: "External — api.press() (e.g. a Monk's Active Tiles lever)"
+};
+
+/** Registry entry merged with the GM's edits from the Setup window ("config" world setting). */
+function getDef(puzzleId) {
+  const base = PUZZLES[puzzleId];
+  if (!base) return null;
+  const cfg = game.settings.get(MODULE_ID, "config")?.[puzzleId];
+  return cfg ? { ...base, ...foundry.utils.deepClone(cfg) } : base;
+}
+
+const pieceKey = item => foundry.utils.getProperty(item?.flags ?? {}, `${MODULE_ID}.key`) ?? null;
+const pieceInstance = item => foundry.utils.getProperty(item?.flags ?? {}, `${MODULE_ID}.instance`) ?? null;
+
+/** Piece keys known in the world: key -> name of the Items-directory item carrying it. */
+function knownPieces() {
+  const out = {};
+  for (const i of game.items) { const k = pieceKey(i); if (k && !out[k]) out[k] = i.name; }
+  return out;
+}
 
 /* -------------------------------------------- */
 /*  Helpers                                     */
@@ -87,17 +158,32 @@ function soulEntry(def, data = null) {
 }
 
 function initialState(def) {
+  if (def.type === "slots") {
+    return { epoch: foundry.utils.randomID(), lock: null, slots: Object.fromEntries((def.slots ?? []).map(s => [s.id, null])),
+      solved: false, released: false, lockedUntil: 0 };
+  }
   return { epoch: foundry.utils.randomID(), lock: null, pans: { left: Array.from({ length: def.soulCount ?? 0 }, () => soulEntry(def)), right: [] } };
 }
 
 function getState(scene, puzzleId) {
   const saved = scene?.getFlag(MODULE_ID, `state.${puzzleId}`);
   if (saved) return foundry.utils.deepClone(saved);
-  return initialState(PUZZLES[puzzleId]);
+  return initialState(getDef(puzzleId));
+}
+
+/** Every tile that opens this puzzle (a slot table can have one per socket). */
+function findPedestals(scene, puzzleId) {
+  return scene?.tiles.filter(t => t.getFlag(MODULE_ID, "puzzle") === puzzleId) ?? [];
 }
 
 function findPedestal(scene, puzzleId) {
-  return scene?.tiles.find(t => t.getFlag(MODULE_ID, "puzzle") === puzzleId) ?? null;
+  return findPedestals(scene, puzzleId)[0] ?? null;
+}
+
+/** Distance in feet from a token to the nearest tile of the puzzle. */
+function distanceToPuzzleFt(tokenDoc, scene, puzzleId) {
+  const tiles = findPedestals(scene, puzzleId);
+  return tiles.length ? Math.min(...tiles.map(t => distanceToPedestalFt(tokenDoc, t))) : Infinity;
 }
 
 function findPuzzleScene(puzzleId) {
@@ -116,13 +202,12 @@ function distanceToPedestalFt(tokenDoc, tile) {
 }
 
 function nearTokenFor(user, scene, puzzleId) {
-  const tile = findPedestal(scene, puzzleId);
-  if (!tile) return null;
-  const reach = PUZZLES[puzzleId].reachFt;
+  if (!findPedestal(scene, puzzleId)) return null;
+  const reach = getDef(puzzleId).reachFt;
   const candidates = user.isSelf
     ? canvas.tokens.controlled.map(t => t.document)
     : scene.tokens.filter(t => t.actor?.testUserPermission(user, "OWNER"));
-  return candidates.find(t => t.parent === scene && t.actor && distanceToPedestalFt(t, tile) <= reach + 0.01) ?? null;
+  return candidates.find(t => t.parent === scene && t.actor && distanceToPuzzleFt(t, scene, puzzleId) <= reach + 0.01) ?? null;
 }
 
 /** Give an item (data) to an actor, stacking onto a matching item when there is one. */
@@ -171,8 +256,9 @@ function gmHandle(msg) {
 
 async function gmApply({ type, payload, userId }) {
   const { puzzleId } = payload;
-  const def = PUZZLES[puzzleId];
+  const def = getDef(puzzleId);
   if (!def) return { ok: false, msg: "Unknown puzzle." };
+  const noun = def.noun ?? "scale";
   const scene = game.scenes.get(payload.sceneId) ?? findPuzzleScene(puzzleId);
   if (!scene) return { ok: false, msg: "Puzzle scene not found." };
   const user = game.users.get(userId);
@@ -189,13 +275,12 @@ async function gmApply({ type, payload, userId }) {
   switch (type) {
     case "claim": {
       if (state.lock && !holdsLock && !lockStale && !user.isGM)
-        return { ok: false, msg: `${state.lock.actorName ?? state.lock.userName} is already using the scale.` };
+        return { ok: false, msg: `${state.lock.actorName ?? state.lock.userName} is already using the ${noun}.` };
       const tok = payload.tokenUuid ? fromUuidSync(payload.tokenUuid) : null;
-      const tile = findPedestal(scene, puzzleId);
       if (!tok?.actor || tok.parent !== scene) return { ok: false, msg: "Select your character's token." };
       if (!user.isGM && !tok.actor.testUserPermission(user, "OWNER")) return { ok: false, msg: "That token isn't yours." };
-      if (!user.isGM && distanceToPedestalFt(tok, tile) > def.reachFt + 0.01)
-        return { ok: false, msg: `Move closer: you must be within ${def.reachFt} ft of the scale.` };
+      if (!user.isGM && distanceToPuzzleFt(tok, scene, puzzleId) > def.reachFt + 0.01)
+        return { ok: false, msg: `Move closer: you must be within ${def.reachFt} ft of the ${noun}.` };
       state.lock = { userId, userName: user.name, tokenUuid: tok.uuid, actorName: tok.name, ts: now };
       await save();
       return { ok: true };
@@ -223,16 +308,25 @@ async function gmApply({ type, payload, userId }) {
     }
   }
 
+  // ----- press (slot tables): anyone, e.g. from a lever tile; no lock needed -----
+  if (type === "press") {
+    if (def.type !== "slots") return { ok: false, msg: "This puzzle has nothing to press." };
+    const r = await slotsPress({ def, state, save, payload, now });
+    const pressTok = payload.tokenUuid ? fromUuidSync(payload.tokenUuid) : null;
+    if (r?.ok) await runTriggers(scene, puzzleId, { actor: pressTok?.actor ?? null, tokenDoc: pressTok, userId });
+    return r;
+  }
+
   // ----- mutating actions: only the lock holder (or a GM) -----
-  if (!holdsLock && !user.isGM) return { ok: false, msg: "You aren't using the scale." };
+  if (!holdsLock && !user.isGM) return { ok: false, msg: `You aren't using the ${noun}.` };
   const tokenDoc = state.lock?.tokenUuid ? fromUuidSync(state.lock.tokenUuid) : null;
   const actor = tokenDoc?.actor;
   if (!actor) return { ok: false, msg: "Character not found." };
   if (state.lock) state.lock.ts = now;
   const panName = payload.pan === "left" ? "left" : "right";
-  const pan = state.pans[panName];
+  const pan = state.pans?.[panName];
 
-  const result = await (async () => { switch (type) {
+  const result = def.type === "slots" ? await slotsApply(type, payload, { def, state, save, actor, now }) : await (async () => { switch (type) {
     case "placeItem": {
       const item = actor.items.get(payload.itemId);
       if (!item) return { ok: false, msg: "Item not found on the sheet." };
@@ -327,6 +421,193 @@ async function gmApply({ type, payload, userId }) {
 }
 
 /* -------------------------------------------- */
+/*  Slot tables (GM side)                       */
+/* -------------------------------------------- */
+
+const STUCK_MSG = "The slots are stuck. Try again in a moment.";
+const misfit = item => `${item.name} doesn't fit the slot.`;
+
+/** Keep the solved / released flags in step with the slots after every change. */
+function settleSlots(def, state) {
+  const filled = def.slots.filter(s => state.slots[s.id]).length;
+  if (filled > 0) state.released = false;
+  if (filled === 0 && state.solved) { state.solved = false; state.released = true; }
+  if (def.verify === "auto" && !state.solved && filled === def.slots.length
+    && def.slots.every(s => state.slots[s.id].key === s.accepts)) {
+    state.solved = true;
+    state.released = false;
+  }
+}
+
+async function slotsApply(type, payload, { def, state, save, actor, now }) {
+  state.slots ??= {};
+  const slotDef = id => def.slots.find(s => s.id === id);
+  const slotOf = entryId => def.slots.find(s => state.slots[s.id]?.id === entryId)?.id ?? null;
+  if ((state.lockedUntil ?? 0) > now) return { ok: false, msg: STUCK_MSG };
+  switch (type) {
+    case "placeSlot": {
+      const slot = slotDef(payload.slot);
+      if (!slot) return { ok: false, msg: "Unknown slot." };
+      if (state.slots[slot.id]) return { ok: false, msg: "That slot already holds a piece." };
+      const item = actor.items.get(payload.itemId);
+      if (!item) return { ok: false, msg: "Item not found on the sheet." };
+      const key = pieceKey(item);
+      if (!key) return { ok: false, msg: misfit(item) };
+      const instance = pieceInstance(item);
+      if (def.requireOriginal) {
+        const registry = game.settings.get(MODULE_ID, "instances") ?? {};
+        if (!instance || !registry[instance]) return { ok: false, msg: misfit(item) };
+        // a duplicated piece carries the same mark: only one of them fits at a time
+        if (Object.values(state.slots).some(e => e?.instance === instance)) return { ok: false, msg: misfit(item) };
+      }
+      const data = item.toObject();
+      delete data._id;
+      const have = Number(item.system.quantity ?? 1) || 1;
+      if (have > 1) await item.update({ "system.quantity": have - 1 });
+      else await item.delete();
+      foundry.utils.setProperty(data, "system.quantity", 1);
+      state.slots[slot.id] = { id: foundry.utils.randomID(), name: item.name, img: item.img, key, instance, data, by: actor.name };
+      settleSlots(def, state);
+      await save();
+      return { ok: true };
+    }
+    case "moveSlot": {
+      const from = slotOf(payload.entryId);
+      const to = slotDef(payload.slot);
+      if (!from || !to) return { ok: false, msg: "That piece is no longer on the table." };
+      if (from === to.id) return { ok: true };
+      const other = state.slots[to.id] ?? null; // swap with what is there
+      state.slots[to.id] = state.slots[from];
+      state.slots[from] = other;
+      settleSlots(def, state);
+      await save();
+      return { ok: true };
+    }
+    case "takeSlot": {
+      const from = slotOf(payload.entryId);
+      if (!from) return { ok: false, msg: "That piece was already taken." };
+      const entry = state.slots[from];
+      state.slots[from] = null;
+      // create, don't stack: the piece must keep its own mark
+      const data = foundry.utils.deepClone(entry.data);
+      if (data.flags?.plutonium) delete data.flags.plutonium;
+      await actor.createEmbeddedDocuments("Item", [data]);
+      settleSlots(def, state);
+      await save();
+      return { ok: true };
+    }
+  }
+  return { ok: false, msg: `Unknown action: ${type}` };
+}
+
+/** Flip a lever tile and spring it back. */
+async function animateLever(tileUuid) {
+  const tile = tileUuid ? fromUuidSync(tileUuid) : null;
+  if (!tile) return;
+  let base = tile.getFlag(MODULE_ID, "leverScaleX");
+  if (base === undefined) { base = tile.texture.scaleX ?? 1; await tile.setFlag(MODULE_ID, "leverScaleX", base); }
+  await tile.update({ "texture.scaleX": -base });
+  setTimeout(() => tile.update({ "texture.scaleX": base }), 1500);
+}
+
+/** Check the combination: right → solved; wrong → the slots lock for a while (T9); a slot empty → nothing happens. */
+async function slotsPress({ def, state, save, payload, now }) {
+  animateLever(payload.tileUuid);
+  if ((state.lockedUntil ?? 0) > now) return { ok: false, msg: STUCK_MSG };
+  playSound(def.pressSound);
+  if (def.slots.some(s => !state.slots?.[s.id])) return { ok: true, msg: "Nothing happens." };
+  if (def.slots.every(s => state.slots[s.id].key === s.accepts)) {
+    if (!state.solved) {
+      state.solved = true;
+      state.released = false;
+      await save();
+    }
+    return { ok: true };
+  }
+  const secs = Number(def.wrongLockSeconds) || 0;
+  state.lockedUntil = secs ? now + secs * 1000 : 0;
+  await save();
+  setTimeout(() => playSound(def.wrongSound), 400);
+  if (def.wrongText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p><em>${def.wrongText}</em></p>` });
+  if (def.wrongGmText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p>${def.wrongGmText}</p>`,
+    whisper: ChatMessage.getWhisperRecipients("GM") });
+  return { ok: true };
+}
+
+/* -------------------------------------------- */
+/*  Original pieces                             */
+/* -------------------------------------------- */
+
+// A piece only fits when it is the one taken in the dungeon. When the Unboxing the Mystery module hands out a tile's
+// item, the GM marks the new item with a unique id and records it in the "instances" world setting. Copies made from
+// the Items directory (or renamed items) never get a recorded mark.
+
+const recentClaims = [];
+const recentCreations = [];
+const claimedCache = new Map(); // tile uuid -> indexes already claimed
+
+async function registerOriginal(item, source = "manual") {
+  const key = pieceKey(item);
+  if (!key) return null;
+  const id = pieceInstance(item) ?? foundry.utils.randomID(16);
+  if (!pieceInstance(item)) await item.update({ [`flags.${MODULE_ID}.instance`]: id });
+  const registry = foundry.utils.deepClone(game.settings.get(MODULE_ID, "instances") ?? {});
+  registry[id] = { key, name: item.name, actor: item.parent?.name ?? "", source, ts: Date.now() };
+  await game.settings.set(MODULE_ID, "instances", registry);
+  return id;
+}
+
+async function matchClaims() {
+  const now = Date.now();
+  for (const list of [recentClaims, recentCreations]) {
+    for (let i = list.length - 1; i >= 0; i--) if (now - list[i].t > 20_000) list.splice(i, 1);
+  }
+  for (const c of [...recentCreations]) {
+    const claim = recentClaims.find(cl => cl.keys.includes(c.key));
+    if (!claim) continue;
+    claim.keys.splice(claim.keys.indexOf(c.key), 1);
+    recentCreations.splice(recentCreations.indexOf(c), 1);
+    await registerOriginal(c.item, claim.tile);
+  }
+}
+
+function watchOriginals() {
+  for (const scene of game.scenes) for (const tile of scene.tiles) {
+    const claimed = tile.flags?.["unboxing-mystery"]?.tileItemsClaimed;
+    if (Array.isArray(claimed)) claimedCache.set(tile.uuid, [...claimed]);
+  }
+  Hooks.on("updateTile", (tile, changes) => {
+    const claimed = foundry.utils.getProperty(changes, "flags.unboxing-mystery.tileItemsClaimed");
+    if (!Array.isArray(claimed)) return;
+    const before = claimedCache.get(tile.uuid) ?? [];
+    claimedCache.set(tile.uuid, [...claimed]);
+    if (!isActiveGM()) return;
+    const linked = tile.flags?.["unboxing-mystery"]?.tileLinkedItems ?? [];
+    const keys = claimed.filter(i => !before.includes(i)).map(i => linked[i]?.uuid).filter(Boolean)
+      .map(uuid => pieceKey(fromUuidSync(uuid))).filter(Boolean);
+    if (!keys.length) return;
+    recentClaims.push({ keys, t: Date.now(), tile: tile.uuid });
+    matchClaims();
+  });
+  Hooks.on("createItem", item => {
+    if (!isActiveGM() || !(item.parent instanceof Actor)) return;
+    const key = pieceKey(item);
+    if (!key || pieceInstance(item)) return;
+    recentCreations.push({ item, key, t: Date.now() });
+    matchClaims();
+  });
+  // Unboxing stacks a looted piece onto one with the same name already on the sheet.
+  Hooks.on("updateItem", (item, changes) => {
+    if (!isActiveGM() || !(item.parent instanceof Actor) || !foundry.utils.hasProperty(changes, "system.quantity")) return;
+    const key = pieceKey(item);
+    const registry = game.settings.get(MODULE_ID, "instances") ?? {};
+    if (!key || registry[pieceInstance(item)]) return;
+    recentCreations.push({ item, key, t: Date.now() });
+    matchClaims();
+  });
+}
+
+/* -------------------------------------------- */
 /*  Triggers                                    */
 /* -------------------------------------------- */
 
@@ -391,14 +672,26 @@ function closeWindowsEverywhere(puzzleId) {
 
 /** GM: after each change, fire every enabled trigger whose conditions now hold (once-only triggers fire once). */
 async function runTriggers(scene, puzzleId, { actor, tokenDoc, userId }) {
-  const def = PUZZLES[puzzleId];
+  const def = getDef(puzzleId);
   const state = getState(scene, puzzleId);
   const fired = new Set(state.fired ?? []);
-  const due = getTriggers(puzzleId).filter(t => t.enabled !== false && !(t.once && fired.has(t.id)) && conditionsMet(t, state, def));
-  if (!due.length) return;
-  for (const t of due) fired.add(t.id);
+  // "once" triggers fire a single time; the others fire each time their conditions become true
+  const active = { ...(state.active ?? {}) };
+  const due = [];
+  for (const t of getTriggers(puzzleId)) {
+    if (t.enabled === false) continue;
+    const met = conditionsMet(t, state, def);
+    if (t.once) { if (met && !fired.has(t.id)) due.push(t); continue; }
+    if (met && !active[t.id]) due.push(t);
+    active[t.id] = met;
+  }
+  const changed = JSON.stringify(active) !== JSON.stringify(state.active ?? {});
+  state.active = active;
+  for (const t of due) if (t.once) fired.add(t.id);
   state.fired = [...fired];
+  if (!due.length && !changed) return;
   await scene.setFlag(MODULE_ID, `state.${puzzleId}`, state);
+  if (!due.length) return;
   const ctx = {
     puzzleId, def, scene, state, actor, tokenDoc, userId, tile: findPedestal(scene, puzzleId),
     distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId), askPlayerSave
@@ -501,6 +794,7 @@ class ScaleView {
     this.scene.add(floor);
 
     this.pedestalTop = 0.32;
+    this.pedestalHalf = { x: 0.45, z: 0.25 };
     const pedestal = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.32, 0.5), stone);
     pedestal.position.y = 0.16;
     pedestal.castShadow = pedestal.receiveShadow = true;
@@ -681,7 +975,7 @@ class ScaleView {
   /** Pan under the pointer (dish or its contents), ignoring the dragged mesh. */
   _panAt(ev) {
     this._setPointer(ev);
-    const targets = [this.pans.left.dish, this.pans.right.dish, ...[...this.entryMeshes.values()].filter(m => m !== this.drag?.mesh)];
+    const targets = [...Object.values(this.pans).map(p => p.dish), ...[...this.entryMeshes.values()].filter(m => m !== this.drag?.mesh)];
     const hit = this.raycaster.intersectObjects(targets, false)[0];
     return hit?.object.userData.pan ?? null;
   }
@@ -692,7 +986,7 @@ class ScaleView {
       const p = new THREE.Vector3(); this.pans[side].dish.getWorldPosition(p); p.project(this.camera);
       return Math.hypot((p.x + 1) / 2 * r.width + r.left - ev.clientX, (1 - p.y) / 2 * r.height + r.top - ev.clientY);
     };
-    return dist("left") < dist("right") ? "left" : "right";
+    return Object.keys(this.pans).reduce((best, side) => (best === null || dist(side) < dist(best) ? side : best), null);
   }
 
   _setHover(mesh) {
@@ -792,7 +1086,7 @@ class ScaleView {
         m.rotation.x += a.vel.z * dt * 4;
         m.rotation.z -= a.vel.x * dt * 4;
         // floor, or the pedestal top when it lands on it
-        const onPedestal = Math.abs(m.position.x) < 0.45 && Math.abs(m.position.z) < 0.25;
+        const onPedestal = Math.abs(m.position.x) < this.pedestalHalf.x && Math.abs(m.position.z) < this.pedestalHalf.z;
         const ground = (onPedestal ? this.pedestalTop : 0) + a.half;
         if (m.position.y <= ground) {
           m.position.y = ground;
@@ -862,6 +1156,139 @@ class ScaleView {
 }
 
 /* -------------------------------------------- */
+/*  3D slot table view                          */
+/* -------------------------------------------- */
+
+/** Geometry for a piece (or, scaled up and flattened, its socket). Returns its height too. */
+function shapeGeometry(shape, k = 1) {
+  switch (shape) {
+    case "pyramid": return { geo: new THREE.ConeGeometry(0.07 * k, 0.1 * k, 4), h: 0.1 * k };
+    case "circle": return { geo: new THREE.CylinderGeometry(0.06 * k, 0.06 * k, 0.025 * k, 40), h: 0.025 * k };
+    case "cylinder": return { geo: new THREE.CylinderGeometry(0.045 * k, 0.045 * k, 0.1 * k, 32), h: 0.1 * k };
+    case "dodecahedron": return { geo: new THREE.DodecahedronGeometry(0.06 * k), h: 0.11 * k };
+    case "plate": return { geo: new THREE.BoxGeometry(0.13 * k, 0.018 * k, 0.09 * k), h: 0.018 * k };
+    default: return { geo: new THREE.BoxGeometry(0.09 * k, 0.09 * k, 0.09 * k), h: 0.09 * k };
+  }
+}
+
+/** A table with a row of sockets; pieces dragged in take the shape of their socket. Reuses the scale's drag code. */
+class SlotsView extends ScaleView {
+  _buildPlaceholder() {
+    const def = this.hooks.def;
+    const slots = def.slots ?? [];
+    const wood = new THREE.MeshStandardMaterial({ color: 0x5b3e26, roughness: 0.8 });
+    const darkWood = new THREE.MeshStandardMaterial({ color: 0x3a281a, roughness: 0.85 });
+    const socketMat = new THREE.MeshStandardMaterial({ color: 0x0d0b09, roughness: 0.95, metalness: 0.1 });
+
+    const floor = new THREE.Mesh(new THREE.CircleGeometry(3, 48), new THREE.MeshStandardMaterial({ color: 0x3a342d, roughness: 1 }));
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    this.scene.add(floor);
+
+    const spacing = 0.3;
+    const width = Math.max(0.8, slots.length * spacing + 0.2), depth = 0.5;
+    this.tableTop = 0.72;
+    this.pedestalTop = this.tableTop;
+    this.pedestalHalf = { x: width / 2, z: depth / 2 };
+    const top = new THREE.Mesh(new THREE.BoxGeometry(width, 0.06, depth), wood);
+    top.position.y = this.tableTop - 0.03;
+    top.castShadow = top.receiveShadow = true;
+    this.scene.add(top);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.06, this.tableTop - 0.06, 0.06), darkWood);
+      leg.position.set(sx * (width / 2 - 0.06), (this.tableTop - 0.06) / 2, sz * (depth / 2 - 0.06));
+      leg.castShadow = true;
+      this.scene.add(leg);
+    }
+
+    this.pans = {};
+    slots.forEach((slot, i) => {
+      const x = (i - (slots.length - 1) / 2) * spacing;
+      const { geo } = shapeGeometry(slot.shape, 1.15);
+      const socket = new THREE.Mesh(geo, socketMat.clone());
+      socket.scale.y = 0.08;
+      if (slot.shape === "pyramid") socket.rotation.y = Math.PI / 4;
+      socket.position.set(x, this.tableTop + 0.002, -0.02);
+      socket.receiveShadow = true;
+      socket.userData.pan = slot.id;
+      this.scene.add(socket);
+
+      const content = new THREE.Group();
+      content.position.set(x, this.tableTop, -0.02);
+      content.userData.pan = slot.id;
+      this.scene.add(content);
+
+      const plaque = new THREE.Mesh(new THREE.PlaneGeometry(0.24, 0.07),
+        new THREE.MeshStandardMaterial({ map: this._plaqueTexture(slot.label), roughness: 0.5, metalness: 0.6 }));
+      plaque.rotation.x = -Math.PI / 2;
+      plaque.position.set(x, this.tableTop + 0.001, 0.15);
+      plaque.receiveShadow = true;
+      this.scene.add(plaque);
+
+      this.pans[slot.id] = { group: content, dish: socket, content };
+    });
+
+    this.camera.position.set(0, 1.32, 0.95);
+    this.controls.target.set(0, this.tableTop, 0);
+    this.controls.minDistance = 0.4;
+    this.controls.update();
+  }
+
+  _plaqueTexture(label) {
+    const c = document.createElement("canvas");
+    c.width = 512; c.height = 150;
+    const g = c.getContext("2d");
+    const grad = g.createLinearGradient(0, 0, 0, 150);
+    grad.addColorStop(0, "#9c7a3c"); grad.addColorStop(1, "#5e4520");
+    g.fillStyle = grad; g.fillRect(0, 0, 512, 150);
+    g.strokeStyle = "#2b1d0c"; g.lineWidth = 8; g.strokeRect(6, 6, 500, 138);
+    g.fillStyle = "#1f150a"; g.textAlign = "center"; g.textBaseline = "middle";
+    g.font = "bold 64px serif";
+    g.fillText(String(label ?? "").slice(0, 16), 256, 80);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  update(state) {
+    if (this.drag || this.anims.length) { this.pendingState = state; return; }
+    this.pendingState = null;
+    for (const mesh of this.entryMeshes.values()) {
+      mesh.parent?.remove(mesh);
+      mesh.geometry?.dispose();
+    }
+    this.entryMeshes.clear();
+    this._setHover(null);
+    const stuck = (state.lockedUntil ?? 0) > Date.now();
+    for (const slot of this.hooks.def.slots ?? []) {
+      const pan = this.pans[slot.id];
+      if (!pan) continue;
+      pan.dish.material.emissive?.setHex(stuck ? 0x5a0a00 : state.solved ? 0x1e3a12 : 0x000000);
+      const e = state.slots?.[slot.id];
+      if (!e) continue;
+      const { geo, h } = shapeGeometry(slot.shape);
+      const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xffffff, map: this._texture(e.img, e.name), roughness: 0.75 }));
+      if (slot.shape === "pyramid") mesh.rotation.y = Math.PI / 4;
+      mesh.userData.height = h;
+      mesh.userData.entryId = e.id;
+      mesh.userData.pan = slot.id;
+      mesh.position.set(0, h / 2 + 0.004, 0);
+      mesh.castShadow = true;
+      pan.content.add(mesh);
+      this.entryMeshes.set(e.id, mesh);
+    }
+  }
+
+  _loop() {
+    this.raf = requestAnimationFrame(this._loop);
+    const dt = Math.min(this.clock.getDelta(), 0.05);
+    this._stepAnims(dt);
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+}
+
+/* -------------------------------------------- */
 /*  Window                                      */
 /* -------------------------------------------- */
 
@@ -877,13 +1304,15 @@ class PuzzleWindow extends ApplicationV2 {
   };
 
   constructor(puzzleId, scene, mode) {
-    super({ id: `theia-puzzle-${puzzleId}`, window: { title: PUZZLES[puzzleId].title } });
+    const def = getDef(puzzleId);
+    super({ id: `theia-puzzle-${puzzleId}`, window: { title: def.title, icon: `fa-solid ${def.icon ?? "fa-scale-balanced"}` } });
     this.puzzleId = puzzleId;
     this.sceneDoc = scene;
     this.mode = mode; // "watch" | "interact"
   }
 
-  get def() { return PUZZLES[this.puzzleId]; }
+  get def() { return getDef(this.puzzleId); }
+  get isSlots() { return this.def.type === "slots"; }
   get state() { return getState(this.sceneDoc, this.puzzleId); }
   get isOperator() { return this.state.lock?.userId === game.user.id; }
 
@@ -911,11 +1340,13 @@ class PuzzleWindow extends ApplicationV2 {
     super._onFirstRender?.(context, options);
     const stage = this.element.querySelector(".tp-stage");
     const side = this.element.querySelector(".tp-side");
-    this.view = new ScaleView(stage, {
+    const slots = this.isSlots;
+    this.view = new (slots ? SlotsView : ScaleView)(stage, {
+      def: this.def,
       canInteract: () => this.mode === "interact" && this.isOperator,
-      onTake: async entryId => !!(await this._act("take", { entryId }))?.ok,
-      onMove: async (entryId, pan) => !!(await this._act("move", { entryId, pan }))?.ok,
-      onDrop: (data, pan) => this._drop(data, pan),
+      onTake: async entryId => !!(await this._act(slots ? "takeSlot" : "take", { entryId }))?.ok,
+      onMove: async (entryId, pan) => !!(await this._act(slots ? "moveSlot" : "move", slots ? { entryId, slot: pan } : { entryId, pan }))?.ok,
+      onDrop: (data, pan) => (slots ? this._dropSlot(data, pan) : this._drop(data, pan)),
       isOverInventory: (x, y) => {
         const r = side.getBoundingClientRect();
         return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
@@ -964,6 +1395,11 @@ class PuzzleWindow extends ApplicationV2 {
     await this._act("placeItem", { itemId: item.id, qty, pan, epoch });
   }
 
+  async _dropSlot(data, slot) {
+    if (data?.kind !== "item" || !slot) return;
+    await this._act("placeSlot", { itemId: data.itemId, slot });
+  }
+
   _actor() {
     const uuid = this.state.lock?.tokenUuid;
     return uuid ? fromUuidSync(uuid)?.actor : null;
@@ -979,19 +1415,36 @@ class PuzzleWindow extends ApplicationV2 {
     const el = this.element;
     const operating = this.mode === "interact" && this.isOperator;
     el.classList.toggle("tp-watching", !operating);
-    el.querySelector(".tp-hint").textContent = operating
-      ? "Drag objects with the left mouse button • Right-drag: orbit • Wheel: zoom • Drag items from the list onto a pan"
-      : "Watching • Right-drag: orbit • Wheel: zoom";
+    const def = this.def;
+    const noun = def.noun ?? "scale";
+    el.querySelector(".tp-hint").textContent = !operating ? "Watching • Right-drag: orbit • Wheel: zoom"
+      : this.isSlots ? "Drag a piece from the list onto a slot • Drag pieces between slots or back onto the list • Right-drag: orbit • Wheel: zoom"
+      : "Drag objects with the left mouse button • Right-drag: orbit • Wheel: zoom • Drag items from the list onto a pan";
 
     const lock = state.lock;
     const who = lock ? foundry.utils.escapeHTML(lock.actorName ?? lock.userName) : "";
     el.querySelector(".tp-status").innerHTML = lock
-      ? `<i class="fa-solid fa-hand"></i> <b>${who}</b> is using the scale${lock.userId === game.user.id ? " (you)" : ""}.`
-      : `<i class="fa-solid fa-eye"></i> Nobody is using the scale.`;
+      ? `<i class="fa-solid fa-hand"></i> <b>${who}</b> is using the ${noun}${lock.userId === game.user.id ? " (you)" : ""}.`
+      : `<i class="fa-solid fa-eye"></i> Nobody is using the ${noun}.`;
 
-    el.querySelector(".tp-weights").innerHTML =
-      `<div><span>Left pan</span><b>${fmtKg(panKg(state.pans.left))}</b></div>` +
-      `<div><span>Right pan</span><b>${fmtKg(panKg(state.pans.right))}</b></div>`;
+    if (this.isSlots) {
+      const esc = foundry.utils.escapeHTML;
+      const pieces = knownPieces();
+      const stuckFor = Math.ceil(((state.lockedUntil ?? 0) - Date.now()) / 1000);
+      el.querySelector(".tp-weights").innerHTML = def.slots.map(s => {
+        const e = state.slots?.[s.id];
+        const gm = game.user.isGM ? `<em class="tp-expects">${esc(pieces[s.accepts] ?? s.accepts ?? "?")}${e ? (e.key === s.accepts ? " ✓" : " ✗") : ""}</em>` : "";
+        return `<div><span>${esc(s.label)}</span><b>${e ? esc(e.name) : "—"}</b>${gm}</div>`;
+      }).join("")
+        + (stuckFor > 0 ? `<p class="tp-stuck"><i class="fa-solid fa-lock"></i> The slots are stuck (${stuckFor} s).</p>` : "")
+        + (state.solved ? `<p class="tp-solved"><i class="fa-solid fa-check"></i> Solved.</p>` : "");
+      clearTimeout(this._stuckTimer);
+      if (stuckFor > 0) this._stuckTimer = setTimeout(() => this.refresh(), 1000);
+    } else {
+      el.querySelector(".tp-weights").innerHTML =
+        `<div><span>Left pan</span><b>${fmtKg(panKg(state.pans.left))}</b></div>` +
+        `<div><span>Right pan</span><b>${fmtKg(panKg(state.pans.right))}</b></div>`;
+    }
 
     const controls = el.querySelector(".tp-controls");
     controls.innerHTML = "";
@@ -1002,14 +1455,17 @@ class PuzzleWindow extends ApplicationV2 {
       b.addEventListener("click", fn);
       controls.appendChild(b);
     };
+    if (operating && this.isSlots && def.verify === "button") btn("Press the slots", "fa-hand-pointer", () => this._act("press"));
     if (operating) btn("Stop interacting", "fa-hand-back-fist", () => this._stopInteracting());
     else if (!lock || game.user.isGM) btn("Interact", "fa-hand", () => this._startInteracting());
     if (game.user.isGM) {
       if (lock && !operating) btn("Release", "fa-unlock", () => this._act("release"));
+      if (this.isSlots) btn("Setup", "fa-gear", () => new SlotsEditor(this.puzzleId).render(true));
       btn("Triggers", "fa-bolt", () => new TriggerEditor(this.puzzleId).render(true));
       btn("Reset", "fa-rotate-left", async () => {
-        const ok = await DialogV2.confirm({ window: { title: "Reset scale" },
-          content: "<p>Return the scale to its starting state? Items and coins left on the pans will be lost.</p>" });
+        const ok = await DialogV2.confirm({ window: { title: `Reset ${noun}` },
+          content: this.isSlots ? "<p>Return the table to its starting state? Pieces left in the slots will be lost.</p>"
+            : "<p>Return the scale to its starting state? Items and coins left on the pans will be lost.</p>" });
         if (ok) this._act("reset");
       });
     }
@@ -1022,6 +1478,7 @@ class PuzzleWindow extends ApplicationV2 {
     if (!operating) { box.innerHTML = ""; return; }
     const actor = this._actor();
     if (!actor) { box.innerHTML = "<p>Character not found.</p>"; return; }
+    if (this.isSlots) return this._renderPieces(box, actor);
     const items = actor.items.filter(i => itemKgEach(i) > 0 && i.system.quantity !== 0)
       .sort((a, b) => a.name.localeCompare(b.name));
     const cur = actor.system.currency ?? {};
@@ -1053,9 +1510,25 @@ class PuzzleWindow extends ApplicationV2 {
     }));
   }
 
+  /** Slot tables: list the pieces (items with a puzzle key) the character carries. */
+  _renderPieces(box, actor) {
+    const esc = foundry.utils.escapeHTML;
+    const items = actor.items.filter(i => pieceKey(i)).sort((a, b) => a.name.localeCompare(b.name));
+    box.innerHTML = `
+      <h3>${esc(actor.name)}</h3>
+      <p class="tp-note">Drag a piece onto a slot. Drag pieces from the table onto this panel to take them back.</p>
+      ${items.length ? `<ul class="tp-items">${items.map(i => `
+        <li draggable="true" data-item-id="${i.id}">
+          <img src="${i.img}"><span class="tp-name">${esc(i.name)}</span>
+        </li>`).join("")}</ul>` : "<p class=\"tp-note\"><em>You carry nothing that fits these slots.</em></p>"}`;
+    box.querySelectorAll("li[draggable]").forEach(li => li.addEventListener("dragstart", ev => {
+      ev.dataTransfer.setData("text/plain", JSON.stringify({ kind: "item", itemId: li.dataset.itemId }));
+    }));
+  }
+
   async _startInteracting() {
     const tok = nearTokenFor(game.user, this.sceneDoc, this.puzzleId) ?? (game.user.isGM ? canvas.tokens.controlled[0]?.document : null);
-    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${this.def.reachFt} ft of the scale.`);
+    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${this.def.reachFt} ft of the ${this.def.noun ?? "scale"}.`);
     const r = await this._act("claim", { tokenUuid: tok.uuid });
     if (!r?.ok) return;
     this.mode = "interact";
@@ -1072,6 +1545,7 @@ class PuzzleWindow extends ApplicationV2 {
 
   async _onClose(options) {
     clearInterval(this.heartbeat);
+    clearTimeout(this._stuckTimer);
     if (this.isOperator) request("release", this._payload());
     this.view?.destroy();
     PuzzleWindow.instances.delete(this.puzzleId);
@@ -1100,9 +1574,11 @@ class TriggerEditor extends ApplicationV2 {
     const esc = v => foundry.utils.escapeHTML(String(v ?? ""));
     const opts = (map, cur) => Object.entries(map).map(([k, v]) =>
       `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(typeof v === "string" ? v : v.label)}</option>`).join("");
-    const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args"];
+    const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args", "walls", "src"];
     const field = (key, val) => key === "rollMode"
       ? `<label class="tpt-f tpt-wide"><span>${key}</span><select data-k="${key}">${opts(ROLL_MODES, val)}</select></label>`
+      : key === "state"
+      ? `<label class="tpt-f"><span>${key}</span><select data-k="${key}">${opts(DOOR_STATES, val)}</select></label>`
       : typeof val === "boolean"
       ? `<label class="tpt-f"><span>${key}</span><input type="checkbox" data-k="${key}" ${val ? "checked" : ""}></label>`
       : `<label class="tpt-f ${wide.includes(key) ? "tpt-wide" : ""}"><span>${key}</span><input type="${typeof val === "number" ? "number" : "text"}" step="any" data-k="${key}" value="${esc(val)}"></label>`;
@@ -1140,7 +1616,7 @@ class TriggerEditor extends ApplicationV2 {
     root.className = "tpt-root";
     root.innerHTML = `
       <div class="tpt-top"><label>Puzzle <select class="tpt-puzzle">${puzzles}</select></label>
-        <p class="tpt-help">Conditions are checked after every change on the scale. Weights are in kg. "Taken off the scale" counts Soul Coins removed from both pans.</p></div>
+        <p class="tpt-help">Conditions are checked after every change on the puzzle. "Once" triggers fire a single time; the others fire every time their conditions become true. Weights are in kg; "Taken off the scale" counts Soul Coins removed from both pans. Door walls are wall ids separated by commas.</p></div>
       ${body || "<p>No triggers yet.</p>"}
       <footer>
         <button type="button" data-do="addTrigger"><i class="fa-solid fa-plus"></i> New trigger</button>
@@ -1215,12 +1691,137 @@ class TriggerEditor extends ApplicationV2 {
 }
 
 /* -------------------------------------------- */
+/*  Slot table setup (GM)                       */
+/* -------------------------------------------- */
+
+const CONFIG_FIELDS = ["slots", "verify", "requireOriginal", "pressSound", "wrongLockSeconds", "wrongSound", "wrongText", "wrongGmText"];
+
+class SlotsEditor extends ApplicationV2 {
+  static DEFAULT_OPTIONS = {
+    classes: ["theia-puzzle-triggers", "theia-puzzle-slots"],
+    window: { title: "Slot table setup", resizable: true, icon: "fa-solid fa-gear" },
+    position: { width: 720, height: 680 }
+  };
+
+  constructor(puzzleId) {
+    super({ id: "theia-puzzle-slots-setup" });
+    this.puzzleId = puzzleId;
+    const def = getDef(puzzleId);
+    this.cfg = foundry.utils.deepClone(Object.fromEntries(CONFIG_FIELDS.map(k => [k, def[k]])));
+  }
+
+  async _renderHTML() {
+    const esc = v => foundry.utils.escapeHTML(String(v ?? ""));
+    const opts = (map, cur) => Object.entries(map).map(([k, v]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(v)}</option>`).join("");
+    const pieces = knownPieces();
+    const c = this.cfg;
+    const registry = game.settings.get(MODULE_ID, "instances") ?? {};
+    const rows = (c.slots ?? []).map((s, i) => {
+      const accepts = { ...pieces };
+      if (s.accepts && !accepts[s.accepts]) accepts[s.accepts] = `${s.accepts} (no item)`;
+      return `<div class="tpt-row tps-slot" data-i="${i}">
+        <input type="text" data-k="label" value="${esc(s.label)}" placeholder="Plaque text">
+        <select data-k="shape">${opts(SHAPES, s.shape)}</select>
+        <select data-k="accepts"><option value="">— nothing —</option>${opts(accepts, s.accepts)}</select>
+        <button type="button" data-do="delSlot" data-i="${i}" title="Remove slot"><i class="fa-solid fa-xmark"></i></button>
+      </div>`;
+    }).join("");
+    const regRows = Object.entries(registry).map(([id, r]) =>
+      `<li><b>${esc(r.name)}</b> — ${esc(r.actor || "?")} <em>(${esc(r.source)})</em> <code>${esc(id)}</code></li>`).join("");
+    const root = document.createElement("div");
+    root.className = "tpt-root";
+    root.innerHTML = `
+      <div class="tpt-top"><p class="tpt-help">Slots, from left to right. A piece is any item with <code>flags.theia-puzzles.key</code>;
+        the slot accepts the piece whose key you choose.</p></div>
+      <section class="tpt-trigger">
+        <h4>Slots</h4>${rows || "<p>No slots.</p>"}
+        <button type="button" class="tpt-add" data-do="addSlot"><i class="fa-solid fa-plus"></i> Slot</button>
+        <h4>Solving</h4>
+        <label class="tpt-f tpt-wide"><span>verify</span><select data-c="verify">${opts(VERIFY_MODES, c.verify)}</select></label>
+        <label class="tpt-f"><span>only original pieces</span><input type="checkbox" data-c="requireOriginal" ${c.requireOriginal ? "checked" : ""}></label>
+        <label class="tpt-f tpt-wide"><span>press sound</span><input type="text" data-c="pressSound" value="${esc(c.pressSound)}"></label>
+        <h4>Wrong combination (pressed with every slot filled)</h4>
+        <label class="tpt-f"><span>lock (s)</span><input type="number" data-c="wrongLockSeconds" value="${esc(c.wrongLockSeconds)}"></label>
+        <label class="tpt-f tpt-wide"><span>sound</span><input type="text" data-c="wrongSound" value="${esc(c.wrongSound)}"></label>
+        <label class="tpt-f tpt-wide"><span>public text</span><input type="text" data-c="wrongText" value="${esc(c.wrongText)}"></label>
+        <label class="tpt-f tpt-wide"><span>GM text</span><input type="text" data-c="wrongGmText" value="${esc(c.wrongGmText)}"></label>
+      </section>
+      <section class="tpt-trigger">
+        <h4>Original pieces</h4>
+        <p class="tpt-help">Pieces handed out by Unboxing the Mystery tiles are recorded automatically. Use the button for pieces given another way.</p>
+        <ul class="tps-registry">${regRows || "<li><em>None yet.</em></li>"}</ul>
+        <button type="button" class="tpt-add" data-do="register"><i class="fa-solid fa-stamp"></i> Record the pieces carried by the selected token</button>
+      </section>
+      <footer>
+        <button type="button" data-do="defaults"><i class="fa-solid fa-rotate-left"></i> Restore defaults</button>
+        <button type="button" data-do="save" class="tpt-save"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+      </footer>`;
+    return root;
+  }
+
+  _replaceHTML(result, content) {
+    content.replaceChildren(result);
+    content.querySelectorAll("[data-do]").forEach(b => b.addEventListener("click", () => this._do(b)));
+  }
+
+  _read() {
+    const el = this.element;
+    if (!el) return;
+    el.querySelectorAll(".tps-slot").forEach(row => {
+      const s = this.cfg.slots[Number(row.dataset.i)];
+      row.querySelectorAll("[data-k]").forEach(inp => { s[inp.dataset.k] = inp.value; });
+    });
+    el.querySelectorAll("[data-c]").forEach(inp => {
+      this.cfg[inp.dataset.c] = inp.type === "checkbox" ? inp.checked : inp.type === "number" ? Number(inp.value) : inp.value;
+    });
+  }
+
+  async _do(btn) {
+    this._read();
+    switch (btn.dataset.do) {
+      case "addSlot": this.cfg.slots.push({ id: foundry.utils.randomID(8), label: "New slot", shape: "cube", accepts: "" }); break;
+      case "delSlot": this.cfg.slots.splice(Number(btn.dataset.i), 1); break;
+      case "defaults": {
+        const base = PUZZLES[this.puzzleId];
+        this.cfg = foundry.utils.deepClone(Object.fromEntries(CONFIG_FIELDS.map(k => [k, base[k]])));
+        break;
+      }
+      case "register": {
+        const actor = canvas.tokens.controlled[0]?.actor;
+        if (!actor) return ui.notifications.warn("Select a token first.");
+        const items = actor.items.filter(i => pieceKey(i));
+        for (const i of items) await registerOriginal(i, "manual");
+        ui.notifications.info(`Theia Puzzles: ${items.length} piece(s) recorded for ${actor.name}.`);
+        break;
+      }
+      case "save": {
+        const all = foundry.utils.deepClone(game.settings.get(MODULE_ID, "config") ?? {});
+        all[this.puzzleId] = this.cfg;
+        await game.settings.set(MODULE_ID, "config", all);
+        ui.notifications.info("Theia Puzzles: table saved. Reopen the puzzle window to see changes to the slots.");
+        return;
+      }
+    }
+    this.render();
+  }
+}
+
+/** Check the combination of a slot table (e.g. from a Monk's Active Tiles lever macro). */
+async function press(puzzleId, { tokenUuid, tileUuid } = {}) {
+  const scene = findPuzzleScene(puzzleId) ?? canvas.scene;
+  const r = await request("press", { puzzleId, sceneId: scene?.id, tokenUuid, tileUuid });
+  if (r?.msg) ui.notifications[r.ok ? "info" : "warn"](r.msg);
+  return r;
+}
+
+/* -------------------------------------------- */
 /*  Entry point                                 */
 /* -------------------------------------------- */
 
 async function open(puzzleId) {
-  const def = PUZZLES[puzzleId];
+  const def = getDef(puzzleId);
   if (!def) return ui.notifications.error(`Theia Puzzles: puzzle "${puzzleId}" doesn't exist.`);
+  const noun = def.noun ?? "scale";
   const scene = findPuzzleScene(puzzleId);
   if (!scene) return ui.notifications.error("Theia Puzzles: no pedestal tile is linked to this puzzle.");
   const existing = PuzzleWindow.instances.get(puzzleId);
@@ -1235,18 +1836,18 @@ async function open(puzzleId) {
   const buttons = [{ action: "watch", label: "Watch", icon: "fa-solid fa-eye" }];
   if (!busy || game.user.isGM) buttons.unshift({ action: "interact", label: "Interact", icon: "fa-solid fa-hand", default: true });
   buttons.push({ action: "cancel", label: "Cancel", icon: "fa-solid fa-xmark" });
-  const why = busy ? `<p><b>${foundry.utils.escapeHTML(lock.actorName ?? lock.userName)}</b> is already using the scale. You can watch.</p>`
-    : (!near && !game.user.isGM ? `<p>To interact, select your token within ${def.reachFt} ft of the scale. You can watch from anywhere.</p>` : "");
+  const why = busy ? `<p><b>${foundry.utils.escapeHTML(lock.actorName ?? lock.userName)}</b> is already using the ${noun}. You can watch.</p>`
+    : (!near && !game.user.isGM ? `<p>To interact, select your token within ${def.reachFt} ft of the ${noun}. You can watch from anywhere.</p>` : "");
   const choice = await DialogV2.wait({
-    window: { title: def.title, icon: "fa-solid fa-scale-balanced" },
-    content: `<p>Interact with the scale?</p>${why}`, buttons, rejectClose: false
+    window: { title: def.title, icon: `fa-solid ${def.icon ?? "fa-scale-balanced"}` },
+    content: `<p>Interact with the ${noun}?</p>${why}`, buttons, rejectClose: false
   });
   if (!choice || choice === "cancel") return;
 
   let mode = "watch";
   if (choice === "interact") {
     const tok = near ?? (game.user.isGM ? canvas.tokens.controlled[0]?.document : null);
-    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${def.reachFt} ft of the scale.`);
+    if (!tok) return ui.notifications.warn(`Select one of your tokens within ${def.reachFt} ft of the ${noun}.`);
     const r = await request("claim", { puzzleId, sceneId: scene.id, tokenUuid: tok.uuid });
     if (!r?.ok) { if (r?.msg) ui.notifications.warn(r.msg); return; }
     mode = "interact";
@@ -1258,14 +1859,17 @@ async function open(puzzleId) {
 
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "triggers", { scope: "world", config: false, type: Object, default: {} });
+  game.settings.register(MODULE_ID, "config", { scope: "world", config: false, type: Object, default: {} });
+  game.settings.register(MODULE_ID, "instances", { scope: "world", config: false, type: Object, default: {} });
   game.settings.registerMenu(MODULE_ID, "triggerMenu", {
     name: "Puzzle triggers", label: "Edit triggers", icon: "fa-solid fa-bolt", restricted: true,
     hint: "Conditions and actions (traps, rewards, macros...) for each puzzle.",
     type: class extends TriggerEditor { constructor() { super(Object.keys(PUZZLES)[0]); } }
   });
   game.modules.get(MODULE_ID).api = {
-    open, PUZZLES, getState, request, getTriggers, setTriggers,
-    editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true)
+    open, press, PUZZLES, getDef, getState, request, getTriggers, setTriggers, registerOriginal,
+    editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true),
+    editSlots: id => new SlotsEditor(id ?? "l22-selos").render(true)
   };
 });
 
@@ -1283,6 +1887,8 @@ Hooks.once("ready", () => {
     game.socket.emit(SOCKET, { type: "result", to: msg.userId, rid: msg.rid, result });
   });
 
+  watchOriginals();
+
   // Creatures caught by a trap can't move until it has been resolved (the GM clears the list afterwards).
   Hooks.on("preUpdateToken", (tokenDoc, changes) => {
     if (!("x" in changes || "y" in changes || "elevation" in changes)) return;
@@ -1296,6 +1902,9 @@ Hooks.once("ready", () => {
   Hooks.on("updateScene", (scene, changes) => {
     if (!foundry.utils.hasProperty(changes, `flags.${MODULE_ID}`)) return;
     for (const win of PuzzleWindow.instances.values()) if (win.sceneDoc === scene) win.refresh();
+  });
+  Hooks.on("updateSetting", setting => {
+    if (setting.key === `${MODULE_ID}.config`) for (const win of PuzzleWindow.instances.values()) win.refresh();
   });
 
   // GM: free the lock if its holder disconnects or goes silent.
