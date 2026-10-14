@@ -118,19 +118,18 @@ PUZZLES["l23-cofre"] = {
     { id: "c", sigil: "seal", label: "Seal" }
   ],
   code: "6-2-9",
-  treasure: true, // a golden bracelet waits inside (3D view)
+  treasure: false, // true: a golden bracelet waits inside the 3D vault
   openSound: "psfx.doors.clean.lock.unlock.wooden.01",
   wrongSound: "",
   wrongLockSeconds: 4,
   wrongText: "The handle won't budge. Somewhere inside the door, the tumblers fall back with a dull clunk.",
   wrongGmText: "L23 vault — the handle was tried without the full combination.",
-  // Tile ids (scene of the puzzle): the closed vault the players click, and the open one with the loot (Unboxing).
+  // Opened from the vault niche door on the map (Theia door with combo "l23-cofre"): solving it opens that door.
   triggers: [{
-    id: "open", name: "Combination accepted — the vault opens", enabled: true, once: true,
+    id: "open", name: "Combination accepted — the vault door opens", enabled: true, once: true,
     conditions: [{ type: "solved", op: "eq", value: 1 }],
     actions: [
-      { type: "tile", tiles: "uUgRo0YGcEzyLro5", hidden: true },
-      { type: "tile", tiles: "WM8WzzUlhI2VbQW6", hidden: false },
+      { type: "door", walls: "Xg0WgCygNoDXc8sr", state: "open" },
       { type: "chat", text: "<p><em>The third click. The handle turns all the way and the heavy door swings open.</em></p>", gmOnly: false }
     ]
   }]
@@ -230,9 +229,20 @@ function getState(scene, puzzleId) {
   return initialState(getDef(puzzleId));
 }
 
-/** Every tile that opens this puzzle (a slot table can have one per socket). */
+/** Every tile that opens this puzzle (a slot table can have one per socket), and doors locked by it (combination). */
 function findPedestals(scene, puzzleId) {
-  return scene?.tiles.filter(t => t.getFlag(MODULE_ID, "puzzle") === puzzleId) ?? [];
+  if (!scene) return [];
+  const tiles = scene.tiles.filter(t => t.getFlag(MODULE_ID, "puzzle") === puzzleId);
+  const doors = scene.walls.filter(w => foundry.utils.getProperty(w.flags ?? {}, `${MODULE_ID}.door.combo`) === puzzleId).map(doorArea);
+  return [...tiles, ...doors];
+}
+
+/** A door as a pedestal: its segment, half a square wider on every side. */
+function doorArea(wall) {
+  const [x1, y1, x2, y2] = wall.c;
+  const pad = wall.parent.grid.size / 2;
+  return { parent: wall.parent, uuid: wall.uuid, x: Math.min(x1, x2) - pad, y: Math.min(y1, y2) - pad,
+    width: Math.abs(x2 - x1) + pad * 2, height: Math.abs(y2 - y1) + pad * 2 };
 }
 
 function findPedestal(scene, puzzleId) {

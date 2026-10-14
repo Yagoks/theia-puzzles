@@ -72,7 +72,7 @@ A safe door with a round combination dial (0–39) and a handle.
 - **Setup** (GM): combination (`6-2-9`), sigils, sounds, texts. The GM window shows the combination and how many clicks were made.
 - Triggers: `solved`, `wrong` (handle tries without the combination); action **Show / hide tiles** swaps the closed vault tile for the open one (Unboxing loot).
 
-Default for L23: combination **6-2-9**, sigils scale (L03), compass rose (L07), seal (L17). The closed vault tile (`api.open("l23-cofre")` through Monk's Active Tiles) hides and the bracelet tile appears when it opens.
+Default for L23: combination **6-2-9**, sigils scale (L03), compass rose (L07), seal (L17). It is opened from the vault niche door on the map (a Theia door with combination `l23-cofre`, see *Locked doors*); solving it opens that door. The 3D vault is empty (`treasure: false`): the bracelet is on the map, looted with Unboxing.
 
 ## Ring locks (`type: "dial"`)
 
@@ -100,6 +100,7 @@ When a player clicks it while it is **locked**, with their token next to it, a w
 - **Keys** that character carries (items flagged as keys, or named "Chave …"/"… Key"); the right one unlocks and opens it. The list only shows when the character has keys.
 - **Break the door**: an attack with one of their weapons against the door's AC. Damage below the door's **damage threshold** does nothing; the rest wears down its Hit Points until it breaks open. The first blow raises the alert once (noise).
 - **Lockpick** (needs Thieves' Tools): the Unboxing the Mystery lockpick minigame. Set it up with *Open Unboxing Controls* on the door (mode Lockpick); Theia keeps that setting and only switches it on while someone is picking.
+- **Combination** (wall config → *Combinação*, a puzzle id such as `l23-cofre`): the door has no lock to pick ("Sem fechadura disponível") and **Inserir combinação** opens that puzzle; its trigger opens the door. Reach is measured to the door.
 
 | Material | AC | HP | Damage threshold |
 |---|---:|---:|---:|
@@ -107,3 +108,4 @@ When a player clicks it while it is **locked**, with their token next to it, a w
 | Porta de ferro | 19 | 30 | 15 |
 | Grade de ferro | 19 | 20 | 10 |
 | Porta de madeira reforçada | 15 | 18 | 5 |
+| Porta do cofre | 25 | 150 | 25 |
