@@ -13,7 +13,7 @@
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
-import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, readyAlert, registerAlert, testBell } from "./alert.js";
+import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, openAlert, readyAlert, registerAlert, testBell } from "./alert.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -327,7 +327,7 @@ async function gmApply({ type, payload, userId }) {
   // ----- press (slot tables): anyone, e.g. from a lever tile; no lock needed -----
   if (type === "press") {
     if (def.type !== "slots") return { ok: false, msg: "This puzzle has nothing to press." };
-    const r = await slotsPress({ def, state, save, payload, now });
+    const r = await slotsPress({ def, state, save, payload, now, origin: findPedestal(scene, puzzleId) });
     const pressTok = payload.tokenUuid ? fromUuidSync(payload.tokenUuid) : null;
     if (r?.ok) await runTriggers(scene, puzzleId, { actor: pressTok?.actor ?? null, tokenDoc: pressTok, userId });
     return r;
@@ -527,7 +527,7 @@ async function animateLever(tileUuid) {
 }
 
 /** Check the combination: right → solved; wrong → the slots lock for a while (T9); a slot empty → nothing happens. */
-async function slotsPress({ def, state, save, payload, now }) {
+async function slotsPress({ def, state, save, payload, now, origin }) {
   animateLever(payload.tileUuid);
   if ((state.lockedUntil ?? 0) > now) return { ok: false, msg: STUCK_MSG };
   playSound(def.pressSound);
@@ -547,7 +547,7 @@ async function slotsPress({ def, state, save, payload, now }) {
   if (def.wrongText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p><em>${def.wrongText}</em></p>` });
   if (def.wrongGmText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p>${def.wrongGmText}</p>`,
     whisper: ChatMessage.getWhisperRecipients("GM") });
-  if (def.alert) await alertOp(def.alert, "raise", { source: def.alertSource, reason: ALERTS[def.alert]?.sources?.[def.alertSource] ?? `${def.title}: wrong combination` });
+  if (def.alert) await alertOp(def.alert, "raise", { source: def.alertSource, reason: ALERTS[def.alert]?.sources?.[def.alertSource] ?? `${def.title}: wrong combination`, origin });
   return { ok: true };
 }
 
@@ -1893,7 +1893,7 @@ Hooks.once("init", () => {
       raise: (id, opts) => alertOp(id, "raise", opts),
       lower: (id, opts) => alertOp(id, "lower", opts),
       set: (id, level) => alertOp(id, "set", { level }),
-      open: id => new AlertPanel(id ?? "casa-angelo").render(true),
+      open: id => openAlert(id ?? "casa-angelo"),
       testBell: id => testBell(id ?? "casa-angelo") // this client only
     }
   };

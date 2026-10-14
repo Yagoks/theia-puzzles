@@ -7,6 +7,9 @@ const SOCKET = `module.${MODULE_ID}`;
 export const ALERTS = {
   "casa-angelo": {
     title: "Casa Angelo — Alert",
+    // With Chatty Wanderers active, the alert of this scene is used instead of the counter below (same levels,
+    // signals and bell, plus patrol reactions). This counter stays as the fallback without that module.
+    chattyScene: "Maze",
     max: 3,
     decayMinutes: 10, // game minutes without a new signal before offering to drop a level
     floorAfterIntrusion: 1,
@@ -103,8 +106,34 @@ async function apply(id, op, opts = {}) {
   return { ok: false };
 }
 
+/** The Chatty Wanderers scene alert that stands in for this counter, when that module is active and set up. */
+export function chattyAlert(id) {
+  const cw = game.modules.get("chatty-wanderers");
+  const name = ALERTS[id]?.chattyScene;
+  if (!cw?.active || !cw.api?.alert || !name) return null;
+  const scene = game.scenes.getName(name);
+  if (!scene || !cw.api.alert.config(scene)?.enabled) return null;
+  return { api: cw.api.alert, scene };
+}
+
+/** Open the GM panel of an alert (the Chatty Wanderers one when it stands in). */
+export function openAlert(id) {
+  const cw = chattyAlert(id);
+  if (cw) return cw.api.open(cw.scene);
+  return new AlertPanel(id).render(true);
+}
+
 /** Raise / lower from any client (players' tile macros reach the GM over the socket). */
 export function alertOp(id, op, opts = {}) {
+  // Chatty Wanderers: its scene alert takes the signal (it rings the bell and moves the patrols itself).
+  const cw = chattyAlert(id);
+  if (cw && op !== "toggle") {
+    if (op === "raise") return cw.api.raise(cw.scene, opts);
+    if (op === "lower") return cw.api.lower(cw.scene, opts);
+    if (op === "set") return cw.api.set(cw.scene, opts.level ?? 0, opts.reason);
+  }
+  // Documents don't travel over the socket.
+  if (opts.origin) opts = { ...opts, origin: undefined };
   if (isActiveGM()) return apply(id, op, opts);
   game.socket.emit(SOCKET, { type: "alert", id, op, opts });
   return Promise.resolve({ ok: true, sent: true });
@@ -202,6 +231,7 @@ async function checkDecay() {
   if (!isActiveGM()) return;
   const now = game.time.worldTime;
   for (const [id, def] of Object.entries(ALERTS)) {
+    if (chattyAlert(id)) continue; // Chatty Wanderers offers it
     const s = getAlert(id);
     if (s.lastSignal === null || s.level <= floorOf(def, s) || s.promptedFor === s.lastSignal) continue;
     const quiet = (now - s.lastSignal) / 60;
