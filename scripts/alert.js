@@ -149,7 +149,7 @@ function ringLocal(id) {
     if (ambient && ambient.walls) {
       // Muffled by walls, as the Ambient Sound is configured.
       canvas.sounds.playAtPosition(file, { x: ambient.x, y: ambient.y, elevation: ambient.elevation ?? 0 }, ambient.radius,
-        { volume: base, easing: ambient.easing, walls: true, gmAlways: true }).catch(err => console.warn(err));
+        { volume: base, easing: ambient.easing, walls: true, gmAlways: !canvas.tokens.controlled.length }).catch(err => console.warn(err));
     } else if (ambient) {
       // Not constrained by walls: volume from the distance alone. (Foundry's own path is unreliable here: Terrain
       // Mapper 0.5.2 drops the "ignore walls" option, so walls would still block the sound.)
@@ -162,9 +162,12 @@ function ringLocal(id) {
   swingTile(def.bellTile ? canvas.tiles?.get(def.bellTile) : null);
 }
 
-/** Volume for this client: the GM always hears it; players by their closest token's distance to the sound. */
+/**
+ * Volume for this client, from the distance between the sound and the closest listening token: the selected tokens,
+ * or (players) the tokens they own. A GM with no token selected hears it at full volume.
+ */
 function bellVolumeAt(ambient, base) {
-  if (game.user.isGM) return base;
+  if (game.user.isGM && !canvas.tokens.controlled.length) return base;
   const tokens = canvas.tokens.controlled.length ? canvas.tokens.controlled
     : canvas.tokens.placeables.filter(t => t.actor?.isOwner);
   if (!tokens.length) return 0;
