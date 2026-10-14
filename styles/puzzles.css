@@ -225,3 +225,14 @@
 .theia-alert .ta-source { display: block; font-size: 12px; }
 .theia-alert .ta-source.off { opacity: 0.6; text-decoration: line-through; }
 .theia-alert .ta-log { margin: 0; padding-left: 16px; font-size: 11px; }
+
+/* Locked doors */
+.tp-door-dialog .tp-door { display: flex; flex-direction: column; gap: 6px; }
+.tp-door-dialog h4 { margin: 4px 0 0; font-size: 13px; }
+.tp-door-dialog .tp-door-keys { display: flex; flex-direction: column; gap: 3px; }
+.tp-door-dialog .tp-door-keys button { display: flex; align-items: center; gap: 6px; justify-content: flex-start; }
+.tp-door-dialog .tp-door-keys img { width: 22px; height: 22px; border: none; }
+.tp-door-dialog .tp-door-row { display: flex; gap: 4px; }
+.tp-door-dialog .tp-door-row select { flex: 1; }
+.tp-door-dialog .tp-door-row button { flex: 0 0 auto; width: auto; }
+.tp-door-config { margin-top: 6px; }

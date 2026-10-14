@@ -13,6 +13,7 @@
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
+import { doorGm, registerDoors } from "./doors.js";
 import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, openAlert, readyAlert, registerAlert, testBell } from "./alert.js";
 
 const MODULE_ID = "theia-puzzles";
@@ -271,6 +272,8 @@ function gmHandle(msg) {
 }
 
 async function gmApply({ type, payload, userId }) {
+  // Locked doors (keys, breaking, lockpick) aren't puzzles.
+  if (type.startsWith("door")) return doorGm(type, payload, userId, { alertOp });
   const { puzzleId } = payload;
   const def = getDef(puzzleId);
   if (!def) return { ok: false, msg: "Unknown puzzle." };
@@ -1879,6 +1882,7 @@ Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "config", { scope: "world", config: false, type: Object, default: {} });
   game.settings.register(MODULE_ID, "instances", { scope: "world", config: false, type: Object, default: {} });
   registerAlert();
+  registerDoors(request);
   game.settings.registerMenu(MODULE_ID, "triggerMenu", {
     name: "Puzzle triggers", label: "Edit triggers", icon: "fa-solid fa-bolt", restricted: true,
     hint: "Conditions and actions (traps, rewards, macros...) for each puzzle.",

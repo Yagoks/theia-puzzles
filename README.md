@@ -71,3 +71,18 @@ A dungeon-wide alarm level (0–3 for Casa Angelo, defined in `scripts/alert.js`
   After an intrusion it never drops below `floorAfterIntrusion`.
 - `api.alert.open(id)` opens the GM panel: current level, what each level does, +1 / −1 / reset, signal toggles and
   history.
+
+
+## Locked doors
+Any door can be made a Theia door (Wall config → "Theia — porta trancada"): material, key name and lockpick.
+When a player clicks it while it is **locked**, with their token next to it, a window offers:
+- **Keys** that character carries (items flagged as keys, or named "Chave …"/"… Key"); the right one unlocks and opens it. The list only shows when the character has keys.
+- **Break the door**: an attack with one of their weapons against the door's AC. Damage below the door's **damage threshold** does nothing; the rest wears down its Hit Points until it breaks open. The first blow raises the alert once (noise).
+- **Lockpick** (needs Thieves' Tools): the Unboxing the Mystery lockpick minigame. Set it up with *Open Unboxing Controls* on the door (mode Lockpick); Theia keeps that setting and only switches it on while someone is picking.
+
+| Material | AC | HP | Damage threshold |
+|---|---:|---:|---:|
+| Porta de pedra | 17 | 27 | 10 |
+| Porta de ferro | 19 | 30 | 15 |
+| Grade de ferro | 19 | 20 | 10 |
+| Porta de madeira reforçada | 15 | 18 | 5 |
