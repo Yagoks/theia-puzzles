@@ -38,6 +38,8 @@ DC 14 Constitution save, taking 2d6 poison (half on success) and Poisoned for 1 
 
 Creatures caught in the trap can't move until it is resolved.
 
+Each save message carries the trap's damage and condition for **Custom Inspirations**: a save rerolled with Heroic Inspiration that flips the result fixes HP and the condition too.
+
 
 ## Slot tables (`type: "slots"`)
 
@@ -58,6 +60,25 @@ character's list take the shape of their socket. Edit everything in **Setup** (G
 
 Several tiles can open the same puzzle (flag `theia-puzzles.puzzle` on each); reach is measured to the nearest one.
 
+
+## Rotary dials (`type: "rotary"`) — L23 vault (`l23-cofre`)
+
+A safe door with a round combination dial (0–39) and a handle.
+- **Drag the dial** around with the left mouse button and let go to stop on a number, or use the side panel (type a number, turn left or right).
+- **Each stop counts.** Turn **right** (clockwise) to the 1st number, **left** to the 2nd, **right** to the 3rd… Stopping on the right number turning the right way gives a **click**; stopping anywhere else lets the tumblers fall back (a **clunk**) and the combination starts over.
+- After the last click, **turn the handle**: the door swings open and the puzzle is solved. Turning it earlier does nothing but a clunk; the dial sticks for a few seconds and the GM gets a whisper.
+- Above the dial, one plaque per number: a sigil (where the clue to that number is found) and an arrow for the way to turn.
+- The clicks and clunks are synthesized in the browser (no sound files) and heard by everyone watching.
+- **Setup** (GM): combination (`6-2-9`), sigils, sounds, texts. The GM window shows the combination and how many clicks were made.
+- Triggers: `solved`, `wrong` (handle tries without the combination); action **Show / hide tiles** swaps the closed vault tile for the open one (Unboxing loot).
+
+Default for L23: combination **6-2-9**, sigils scale (L03), compass rose (L07), seal (L17). The closed vault tile (`api.open("l23-cofre")` through Monk's Active Tiles) hides and the bracelet tile appears when it opens.
+
+## Ring locks (`type: "dial"`)
+
+A door with numbered rings (a cryptex) and a handle; kept for future puzzles (no puzzle uses it yet). Click the top or
+bottom of a ring (or scroll over it) to turn it, then the handle. A wrong combination sticks the rings for a few seconds.
+Same Setup, sigils and triggers as the rotary dial.
 
 ## Alert counters
 

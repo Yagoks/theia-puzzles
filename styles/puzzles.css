@@ -236,3 +236,17 @@
 .tp-door-dialog .tp-door-row select { flex: 1; }
 .tp-door-dialog .tp-door-row button { flex: 0 0 auto; width: auto; }
 .tp-door-config { margin-top: 6px; }
+
+/* Combination dials */
+.theia-puzzle .tp-dial-rings { display: flex; gap: 10px; justify-content: center; margin: 8px 0; }
+.theia-puzzle .tp-dial-ring { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.theia-puzzle .tp-dial-ring b { font-size: 26px; font-family: serif; min-width: 36px; text-align: center;
+  background: #2a1f14; border: 1px solid #a57c3c; border-radius: 4px; padding: 2px 0; }
+.theia-puzzle .tp-dial-ring button { width: 40px; padding: 0; line-height: 24px; }
+.theia-puzzle .tp-dial-try { width: 100%; margin-top: 6px; }
+
+/* Rotary dials */
+.theia-puzzle .tp-rotary-turn { display: flex; gap: 6px; align-items: center; justify-content: center; margin: 8px 0; }
+.theia-puzzle .tp-rotary-turn input { width: 64px; font-size: 22px; font-family: serif; text-align: center; height: 34px; }
+.theia-puzzle .tp-rotary-turn button { width: 44px; height: 34px; padding: 0; }
+.theia-puzzle .tp-rotary-said { margin: 6px 0 0; font-style: italic; color: #e8c77a; }

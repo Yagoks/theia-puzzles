@@ -10,7 +10,9 @@ export const CONDITION_TYPES = {
   solved: { label: "Solved (1 = yes, 0 = no)", fields: ["op", "value"] },
   released: { label: "Emptied after being solved (1 = yes)", fields: ["op", "value"] },
   filled: { label: "Slots filled", fields: ["op", "value"] },
-  correct: { label: "Slots with the right piece", fields: ["op", "value"] }
+  correct: { label: "Slots with the right piece", fields: ["op", "value"] },
+  // dials
+  wrong: { label: "Wrong combinations tried", fields: ["op", "value"] }
 };
 
 export const DOOR_STATES = { open: "Unlocked and open", closed: "Closed (unlocked)", locked: "Closed and locked" };
@@ -35,6 +37,7 @@ export const ACTION_TYPES = {
   macro: { label: "Run macro", fields: { name: "", args: "" } },
   closeWindow: { label: "Close the puzzle window", fields: {} },
   door: { label: "Set doors (wall ids)", fields: { walls: "", state: "open" } },
+  tile: { label: "Show / hide tiles (tile ids)", fields: { tiles: "", hidden: false } },
   sound: { label: "Play a sound for everyone", fields: { src: "", volume: 0.8 } },
   alert: { label: "Raise an alert counter", fields: { id: "casa-angelo", amount: 1, reason: "" } }
 };
@@ -78,6 +81,7 @@ export function conditionsMet(trigger, state, def) {
       case "released": return compare(state.released ? 1 : 0, c.op, value);
       case "filled": return compare(filled, c.op, value);
       case "correct": return compare(correct, c.op, value);
+      case "wrong": return compare(state.wrong ?? 0, c.op, value);
       case "hasItem": {
         const name = String(c.name ?? "").trim().toLowerCase();
         return !!name && listOf(c.pan).some(e => String(e.name ?? "").toLowerCase() === name);
@@ -100,10 +104,18 @@ function saveFlavor(action) {
   return `${CONFIG.DND5E.abilities[action.ability]?.label ?? action.ability} save DC ${action.dc} — ${action.flavor || "trap"}`;
 }
 
+/**
+ * What the trap does to whoever fails / succeeds, stored on the save message so Custom Inspirations can fix damage
+ * and condition when the save is rerolled with Heroic Inspiration (flags.custom-inspirations.saveLink).
+ */
+export function saveLinkFlags(link) {
+  return link ? { "custom-inspirations": { saveLink: link } } : {};
+}
+
 /** GM rolls one save itself. */
-async function gmSave(action, actor) {
+async function gmSave(action, actor, link) {
   const rolls = await actor.rollSavingThrow({ ability: action.ability, target: Number(action.dc) },
-    { configure: false }, { data: { flavor: saveFlavor(action) } });
+    { configure: false }, { data: { flavor: saveFlavor(action), flags: saveLinkFlags(link) } });
   const roll = Array.isArray(rolls) ? rolls[0] : rolls;
   return roll?.total ?? 0;
 }
@@ -121,7 +133,7 @@ export function playerFor(actor) {
  *   within rollTimeout seconds) are rolled by the GM.
  * - epic: one Epic Rolls 5e request for everyone; missing results are rolled by the GM.
  */
-async function rollSaves(action, targets, ctx) {
+async function rollSaves(action, targets, ctx, link = null) {
   const out = new Map();
   const mode = action.rollMode || "auto";
   const timeoutMs = Math.max(5, Number(action.rollTimeout) || 30) * 1000;
@@ -142,11 +154,11 @@ async function rollSaves(action, targets, ctx) {
     await Promise.all(targets.map(async t => {
       const user = playerFor(t.actor);
       if (!user) return;
-      const total = await ctx.askPlayerSave(user, t, { ability: action.ability, dc: Number(action.dc), flavor: saveFlavor(action), timeoutMs });
+      const total = await ctx.askPlayerSave(user, t, { ability: action.ability, dc: Number(action.dc), flavor: saveFlavor(action), timeoutMs, link });
       if (typeof total === "number") out.set(t.id, total);
     }));
   }
-  for (const t of targets) if (!out.has(t.id)) out.set(t.id, await gmSave(action, t.actor));
+  for (const t of targets) if (!out.has(t.id)) out.set(t.id, await gmSave(action, t.actor, link));
   return out;
 }
 
@@ -226,7 +238,12 @@ export async function runTrap(action, ctx) {
 
   const rows = [];
   const status = action.status ? CONFIG.statusEffects.find(s => s.id === action.status) : null;
-  const saves = (action.ability && action.dc) ? await rollSaves(action, targets, ctx) : new Map();
+  const link = {
+    damages: dmgRoll ? [{ value: dmgRoll.total, type: action.damageType || undefined }] : [],
+    onSave: action.half ? "half" : "none",
+    status: status?.id ?? "", statusSeconds: Number(action.statusSeconds) || 0
+  };
+  const saves = (action.ability && action.dc) ? await rollSaves(action, targets, ctx, link) : new Map();
   for (const t of targets) {
     const actor = t.actor;
     const saveTotal = saves.has(t.id) ? saves.get(t.id) : null;
@@ -295,6 +312,11 @@ export async function runAction(action, ctx) {
       const ids = String(action.walls ?? "").split(/[\s,;]+/).filter(id => ctx.scene.walls.has(id));
       if (ds === undefined || !ids.length) return;
       return ctx.scene.updateEmbeddedDocuments("Wall", ids.map(_id => ({ _id, ds })));
+    }
+    case "tile": {
+      const ids = String(action.tiles ?? "").split(/[\s,;]+/).filter(id => ctx.scene.tiles.has(id));
+      if (!ids.length) return;
+      return ctx.scene.updateEmbeddedDocuments("Tile", ids.map(_id => ({ _id, hidden: !!action.hidden })));
     }
     case "sound": return playSound(action.src, action.volume);
     case "alert": return ctx.alertOp?.(action.id, "raise", { amount: Number(action.amount) || 1, reason: action.reason || ctx.def.title });

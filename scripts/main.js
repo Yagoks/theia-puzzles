@@ -9,10 +9,11 @@
 // - One operator at a time ("Interact", must stand within reach of the pedestal); anyone can "Watch"
 //   from anywhere in the scene and follow it live.
 // - Puzzle types: "scale" (weigh items and coins on two pans) and "slots" (a table of sockets that take specific
-//   pieces; solved automatically, by a button, or from outside through api.press(), e.g. a Monk's Active Tiles lever).
+//   pieces; solved automatically, by a button, or from outside through api.press(), e.g. a Monk's Active Tiles lever)
+//   and "dial" (a combination lock: numbered rings and a handle).
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
-import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
+import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound, saveLinkFlags } from "./triggers.js";
 import { doorGm, registerDoors } from "./doors.js";
 import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, openAlert, readyAlert, registerAlert, testBell } from "./alert.js";
 
@@ -102,6 +103,52 @@ const PUZZLES = {
   }
 };
 
+PUZZLES["l23-cofre"] = {
+  type: "rotary",
+  title: "Bracelet Vault",
+  noun: "vault",
+  icon: "fa-vault",
+  reachFt: 5,
+  digits: 40,
+  // One entry per number of the combination: the sigil engraved above the dial (the notes with the numbers are found in
+  // the rooms these sigils point to). Turn right for the 1st number, left for the 2nd, right for the 3rd...
+  rings: [
+    { id: "a", sigil: "scale", label: "Scale" },
+    { id: "b", sigil: "compass", label: "Compass" },
+    { id: "c", sigil: "seal", label: "Seal" }
+  ],
+  code: "6-2-9",
+  treasure: true, // a golden bracelet waits inside (3D view)
+  openSound: "psfx.doors.clean.lock.unlock.wooden.01",
+  wrongSound: "",
+  wrongLockSeconds: 4,
+  wrongText: "The handle won't budge. Somewhere inside the door, the tumblers fall back with a dull clunk.",
+  wrongGmText: "L23 vault — the handle was tried without the full combination.",
+  // Tile ids (scene of the puzzle): the closed vault the players click, and the open one with the loot (Unboxing).
+  triggers: [{
+    id: "open", name: "Combination accepted — the vault opens", enabled: true, once: true,
+    conditions: [{ type: "solved", op: "eq", value: 1 }],
+    actions: [
+      { type: "tile", tiles: "uUgRo0YGcEzyLro5", hidden: true },
+      { type: "tile", tiles: "WM8WzzUlhI2VbQW6", hidden: false },
+      { type: "chat", text: "<p><em>The third click. The handle turns all the way and the heavy door swings open.</em></p>", gmOnly: false }
+    ]
+  }]
+};
+
+/** Sigils that can be engraved above the rings of a dial. */
+const SIGILS = { scale: "Scale", compass: "Compass rose", seal: "Wax seal", eye: "Eye", key: "Key", none: "— none —" };
+
+/** "6-2-9", "629" or [6, 2, 9] -> [6, 2, 9] (numbers above 9 need separators: "12-30-4"). */
+function parseCode(code, rings) {
+  const list = Array.isArray(code) ? code : String(code ?? "").includes("-") || String(code ?? "").includes(",")
+    ? String(code).split(/[-,\s]+/) : String(code ?? "").split("");
+  return Array.from({ length: rings }, (_, i) => Number(list[i]) || 0);
+}
+
+/** Rotary dials: the direction to turn for each number of the combination (1 = right / clockwise, -1 = left). */
+const rotaryDir = step => (step % 2 === 0 ? 1 : -1);
+
 /** Socket / piece shapes of slot tables. */
 const SHAPES = { cube: "Cube", pyramid: "Pyramid", circle: "Circle (disc)", cylinder: "Cylinder", dodecahedron: "Dodecahedron", plate: "Plate" };
 const VERIFY_MODES = {
@@ -163,6 +210,13 @@ function soulEntry(def, data = null) {
 }
 
 function initialState(def) {
+  if (def.type === "rotary") {
+    return { epoch: foundry.utils.randomID(), lock: null, pos: 0, step: 0, solved: false, lockedUntil: 0, wrong: 0, last: null };
+  }
+  if (def.type === "dial") {
+    return { epoch: foundry.utils.randomID(), lock: null, dials: (def.rings ?? []).map(() => 0), solved: false, lockedUntil: 0,
+      wrong: 0, lastTry: null };
+  }
   if (def.type === "slots") {
     return { epoch: foundry.utils.randomID(), lock: null, slots: Object.fromEntries((def.slots ?? []).map(s => [s.id, null])),
       solved: false, released: false, lockedUntil: 0 };
@@ -345,7 +399,9 @@ async function gmApply({ type, payload, userId }) {
   const panName = payload.pan === "left" ? "left" : "right";
   const pan = state.pans?.[panName];
 
-  const result = def.type === "slots" ? await slotsApply(type, payload, { def, state, save, actor, now }) : await (async () => { switch (type) {
+  const result = def.type === "rotary" ? await rotaryApply(type, payload, { def, state, save, actor, now })
+    : def.type === "dial" ? await dialApply(type, payload, { def, state, save, actor, now })
+    : def.type === "slots" ? await slotsApply(type, payload, { def, state, save, actor, now }) : await (async () => { switch (type) {
     case "placeItem": {
       const item = actor.items.get(payload.itemId);
       if (!item) return { ok: false, msg: "Item not found on the sheet." };
@@ -519,6 +575,107 @@ async function slotsApply(type, payload, { def, state, save, actor, now }) {
   return { ok: false, msg: `Unknown action: ${type}` };
 }
 
+/* -------------------------------------------- */
+/*  Combination dials (GM side)                 */
+/* -------------------------------------------- */
+
+const DIAL_STUCK_MSG = "The rings are stuck. Try again in a moment.";
+
+async function dialApply(type, payload, { def, state, save, actor, now }) {
+  const rings = def.rings ?? [];
+  const n = Number(def.digits) || 10;
+  state.dials = rings.map((_, i) => Number(state.dials?.[i]) || 0);
+  if (state.solved) return { ok: false, msg: `The ${def.noun ?? "vault"} is already open.` };
+  if ((state.lockedUntil ?? 0) > now) return { ok: false, msg: DIAL_STUCK_MSG };
+  switch (type) {
+    case "turnDial": {
+      const i = Number(payload.ring);
+      if (!(i >= 0 && i < rings.length)) return { ok: false, msg: "Unknown ring." };
+      const delta = Math.sign(Number(payload.delta) || 1);
+      state.dials[i] = (((state.dials[i] + delta) % n) + n) % n;
+      await save();
+      return { ok: true };
+    }
+    case "tryDial": {
+      const code = parseCode(def.code, rings.length);
+      const right = code.every((c, i) => state.dials[i] === c);
+      state.lastTry = { ts: now, ok: right };
+      if (right) {
+        state.solved = true;
+        await save();
+        playSound(def.openSound);
+        return { ok: true };
+      }
+      state.wrong = (state.wrong ?? 0) + 1;
+      const secs = Number(def.wrongLockSeconds) || 0;
+      state.lockedUntil = secs ? now + secs * 1000 : 0;
+      await save();
+      playSound(def.wrongSound);
+      const speaker = { alias: def.title };
+      if (def.wrongText) await ChatMessage.create({ speaker, content: `<p><em>${def.wrongText}</em></p>` });
+      if (def.wrongGmText) await ChatMessage.create({ speaker, whisper: ChatMessage.getWhisperRecipients("GM"),
+        content: `<p>${def.wrongGmText} ${foundry.utils.escapeHTML(actor.name)} tried <b>${state.dials.join("-")}</b> (attempt ${state.wrong}).</p>` });
+      return { ok: true };
+    }
+  }
+  return { ok: false, msg: `Unknown action: ${type}` };
+}
+
+/* -------------------------------------------- */
+/*  Rotary dials (GM side)                      */
+/* -------------------------------------------- */
+
+// A safe dial: turn right and stop on the 1st number (a click), left to the 2nd (a click), right to the 3rd (a click),
+// then turn the handle. Stopping anywhere else, or turning the wrong way, lets the tumblers fall back to the start.
+
+async function rotaryApply(type, payload, { def, state, save, actor, now }) {
+  const n = Number(def.digits) || 40;
+  const code = parseCode(def.code, (def.rings ?? []).length).map(c => ((c % n) + n) % n);
+  state.step = Number(state.step) || 0;
+  if (state.solved) return { ok: false, msg: `The ${def.noun ?? "vault"} is already open.` };
+  if ((state.lockedUntil ?? 0) > now) return { ok: false, msg: "The dial is stuck. Try again in a moment." };
+  switch (type) {
+    case "spinRotary": {
+      const to = ((Math.round(Number(payload.to) || 0) % n) + n) % n;
+      const dir = Number(payload.dir) < 0 ? -1 : 1;
+      state.pos = to;
+      const right = state.step < code.length && to === code[state.step] && dir === rotaryDir(state.step);
+      if (right) {
+        state.step += 1;
+        state.last = { ts: now, kind: "tick", step: state.step };
+      } else {
+        // progress lost: the tumblers fall back (silent when there was nothing to lose)
+        state.last = { ts: now, kind: state.step ? "reset" : "none" };
+        state.step = 0;
+      }
+      await save();
+      return { ok: true };
+    }
+    case "tryRotary": {
+      if (state.step >= code.length) {
+        state.solved = true;
+        state.last = { ts: now, kind: "open" };
+        await save();
+        playSound(def.openSound);
+        return { ok: true };
+      }
+      state.wrong = (state.wrong ?? 0) + 1;
+      state.step = 0;
+      state.last = { ts: now, kind: "stuck" };
+      const secs = Number(def.wrongLockSeconds) || 0;
+      state.lockedUntil = secs ? now + secs * 1000 : 0;
+      await save();
+      playSound(def.wrongSound);
+      const speaker = { alias: def.title };
+      if (def.wrongText) await ChatMessage.create({ speaker, content: `<p><em>${def.wrongText}</em></p>` });
+      if (def.wrongGmText) await ChatMessage.create({ speaker, whisper: ChatMessage.getWhisperRecipients("GM"),
+        content: `<p>${def.wrongGmText} ${foundry.utils.escapeHTML(actor.name)} (attempt ${state.wrong}).</p>` });
+      return { ok: true };
+    }
+  }
+  return { ok: false, msg: `Unknown action: ${type}` };
+}
+
 /** Flip a lever tile and spring it back. */
 async function animateLever(tileUuid) {
   const tile = tileUuid ? fromUuidSync(tileUuid) : null;
@@ -644,13 +801,13 @@ async function setTriggers(puzzleId, list) {
 
 /** GM: ask a player to roll a save from their own client. Resolves with the total, or null on timeout. */
 const saveWaits = {};
-function askPlayerSave(user, tokenDoc, { ability, dc, flavor, timeoutMs }) {
+function askPlayerSave(user, tokenDoc, { ability, dc, flavor, timeoutMs, link = null }) {
   const rid = foundry.utils.randomID();
   return new Promise(resolve => {
     const timer = setTimeout(() => { delete saveWaits[rid]; resolve(null); }, timeoutMs);
     saveWaits[rid] = total => { clearTimeout(timer); delete saveWaits[rid]; resolve(total); };
     game.socket.emit(SOCKET, { type: "saveRequest", to: user.id, rid, actorUuid: tokenDoc.actor.uuid, tokenName: tokenDoc.name,
-      ability, dc, flavor, timeoutMs });
+      ability, dc, flavor, timeoutMs, link });
   });
 }
 
@@ -674,7 +831,7 @@ async function onSaveRequest(msg) {
     buttons: [{
       action: "roll", label: `Roll ${label} save`, icon: "fa-solid fa-dice-d20", default: true,
       callback: async () => {
-        const rolls = await actor.rollSavingThrow({ ability: msg.ability, target: msg.dc }, {}, { data: { flavor: msg.flavor } });
+        const rolls = await actor.rollSavingThrow({ ability: msg.ability, target: msg.dc }, {}, { data: { flavor: msg.flavor, flags: saveLinkFlags(msg.link) } });
         const roll = Array.isArray(rolls) ? rolls[0] : rolls;
         if (roll) send(roll.total);
       }
@@ -1309,6 +1466,641 @@ class SlotsView extends ScaleView {
 }
 
 /* -------------------------------------------- */
+/*  3D combination dial view                    */
+/* -------------------------------------------- */
+
+/** Draw a sigil, centered in a size×size box, with the current fill / stroke style. */
+function drawSigil(g, sigil, size) {
+  const c = size / 2, r = size * 0.36;
+  g.lineWidth = size * 0.05;
+  g.lineCap = g.lineJoin = "round";
+  g.beginPath();
+  switch (sigil) {
+    case "scale": {
+      g.moveTo(c, c - r); g.lineTo(c, c + r * 0.85);
+      g.moveTo(c - r * 0.55, c + r * 0.85); g.lineTo(c + r * 0.55, c + r * 0.85);
+      g.moveTo(c - r, c - r * 0.6); g.lineTo(c + r, c - r * 0.6);
+      for (const sx of [-1, 1]) {
+        const x = c + sx * r;
+        g.moveTo(x, c - r * 0.6); g.lineTo(x - r * 0.32, c + r * 0.1);
+        g.moveTo(x, c - r * 0.6); g.lineTo(x + r * 0.32, c + r * 0.1);
+        g.moveTo(x - r * 0.4, c + r * 0.1); g.quadraticCurveTo(x, c + r * 0.5, x + r * 0.4, c + r * 0.1); g.closePath();
+      }
+      g.stroke();
+      return;
+    }
+    case "compass": {
+      g.arc(c, c, r, 0, Math.PI * 2);
+      g.stroke();
+      g.beginPath();
+      const p = (rad, ang) => [c + Math.cos(ang) * rad, c + Math.sin(ang) * rad];
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2 - Math.PI / 2;
+        const len = i % 2 ? r * 0.55 : r * 1.12;
+        g.moveTo(...p(r * 0.14, a - 0.63)); g.lineTo(...p(len, a)); g.lineTo(...p(r * 0.14, a + 0.63));
+      }
+      g.fill();
+      return;
+    }
+    case "seal": {
+      const n = 14;
+      for (let i = 0; i <= n * 2; i++) {
+        const a = (i / (n * 2)) * Math.PI * 2;
+        const rad = i % 2 ? r : r * 0.88;
+        g.lineTo(c + Math.cos(a) * rad, c + Math.sin(a) * rad);
+      }
+      g.fill();
+      g.save();
+      g.globalCompositeOperation = "destination-out";
+      g.beginPath(); g.arc(c, c, r * 0.62, 0, Math.PI * 2); g.lineWidth = size * 0.035; g.stroke();
+      g.beginPath();
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2 - Math.PI / 2, b = a + Math.PI / 5;
+        g.lineTo(c + Math.cos(a) * r * 0.42, c + Math.sin(a) * r * 0.42);
+        g.lineTo(c + Math.cos(b) * r * 0.17, c + Math.sin(b) * r * 0.17);
+      }
+      g.fill();
+      g.restore();
+      return;
+    }
+    case "eye": {
+      g.moveTo(c - r, c); g.quadraticCurveTo(c, c - r * 1.1, c + r, c); g.quadraticCurveTo(c, c + r * 1.1, c - r, c);
+      g.stroke();
+      g.beginPath(); g.arc(c, c, r * 0.32, 0, Math.PI * 2); g.fill();
+      return;
+    }
+    case "key": {
+      g.arc(c - r * 0.5, c, r * 0.38, 0, Math.PI * 2);
+      g.moveTo(c - r * 0.12, c); g.lineTo(c + r, c);
+      g.moveTo(c + r * 0.75, c); g.lineTo(c + r * 0.75, c + r * 0.35);
+      g.moveTo(c + r * 0.45, c); g.lineTo(c + r * 0.45, c + r * 0.28);
+      g.stroke();
+      return;
+    }
+  }
+}
+
+/** A vault door with numbered rings (a cryptex lock) and a handle. Reuses the scale's renderer, lights and loop. */
+class DialView extends ScaleView {
+  /** The safe: floor, iron body open at the front, a red door on a hinge (this.hinge). Returns what the front needs. */
+  _buildBody(W) {
+    const iron = new THREE.MeshStandardMaterial({ color: 0x3b3633, metalness: 0.8, roughness: 0.45 });
+    const red = new THREE.MeshStandardMaterial({ color: 0x5a1d18, metalness: 0.55, roughness: 0.55 });
+    const brass = new THREE.MeshStandardMaterial({ color: 0xa57c3c, metalness: 0.9, roughness: 0.3 });
+
+    const floor = new THREE.Mesh(new THREE.CircleGeometry(3, 48), new THREE.MeshStandardMaterial({ color: 0x2c2522, roughness: 1 }));
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    this.scene.add(floor);
+
+    // body, open at the front (the door covers it)
+    const H = 0.78, D = 0.6, wallT = 0.04;
+    this.pedestalTop = H;
+    this.pedestalHalf = { x: W / 2, z: D / 2 };
+    const parts = [
+      [W, wallT, D, 0, H - wallT / 2, 0], [W, wallT, D, 0, wallT / 2, 0],
+      [wallT, H, D, -W / 2 + wallT / 2, H / 2, 0], [wallT, H, D, W / 2 - wallT / 2, H / 2, 0],
+      [W, H, wallT, 0, H / 2, -D / 2 + wallT / 2]
+    ];
+    for (const [w, h, d, x, y, z] of parts) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), iron);
+      m.position.set(x, y, z);
+      m.castShadow = m.receiveShadow = true;
+      this.scene.add(m);
+    }
+    const inside = new THREE.Mesh(new THREE.PlaneGeometry(W - 0.1, H - 0.1), new THREE.MeshStandardMaterial({ color: 0x0b0908, roughness: 1 }));
+    inside.position.set(0, H / 2, -D / 2 + wallT + 0.001);
+    this.scene.add(inside);
+    if (this.hooks.def.treasure) {
+      // what waits inside (seen once the door opens), lit by a faint glow
+      const gold = new THREE.MeshStandardMaterial({ color: 0xe0b04a, metalness: 1, roughness: 0.2, emissive: 0x3a2400 });
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.075, 0.014, 16, 48), gold);
+      ring.rotation.x = 0.35; // propped up, facing the door
+      ring.position.set(0, wallT + 0.085, -0.05);
+      ring.castShadow = true;
+      this.scene.add(ring);
+      const glow = new THREE.PointLight(0xffc870, 0.6, 0.8);
+      glow.position.set(0, 0.25, 0.05);
+      this.scene.add(glow);
+    }
+
+    // door on a hinge at the left edge
+    this.hinge = new THREE.Group();
+    this.hinge.position.set(-W / 2, 0, D / 2);
+    this.scene.add(this.hinge);
+    const door = new THREE.Mesh(new THREE.BoxGeometry(W - 0.02, H - 0.02, 0.045), red);
+    door.position.set(W / 2, H / 2, 0.0225);
+    door.castShadow = door.receiveShadow = true;
+    this.hinge.add(door);
+    for (const y of [0.12, H - 0.12]) {
+      const band = new THREE.Mesh(new THREE.BoxGeometry(W - 0.02, 0.035, 0.012), iron);
+      band.position.set(W / 2, y, 0.05);
+      this.hinge.add(band);
+    }
+    for (const sx of [0.05, W - 0.05]) for (const y of [0.05, H - 0.05]) {
+      const rivet = new THREE.Mesh(new THREE.SphereGeometry(0.012, 10, 8), brass);
+      rivet.position.set(sx, y, 0.047);
+      this.hinge.add(rivet);
+    }
+    this.camera.position.set(0.12, H * 0.75, 1.75);
+    this.controls.target.set(0, H * 0.5, 0.3);
+    this.controls.minDistance = 0.5;
+    this.controls.maxDistance = 2.4;
+    this.controls.update();
+    return { iron, brass, H, front: 0.047 };
+  }
+
+  /** A lever handle on the door (this.handle, this.handleParts). */
+  _buildHandle(x, y, front, brass) {
+    this.handle = new THREE.Group();
+    this.handle.position.set(x, y, front + 0.03);
+    this.hinge.add(this.handle);
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.05, 24), brass);
+    hub.rotation.x = Math.PI / 2;
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.17, 0.03), brass);
+    bar.position.set(0, 0.085, 0.025);
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(0.025, 16, 12), brass);
+    knob.position.set(0, 0.17, 0.025);
+    for (const m of [hub, bar, knob]) { m.userData.handle = true; m.castShadow = true; this.handle.add(m); }
+    this.handleParts = [hub, bar, knob];
+    this.handleAngle = this.handleTarget = 0;
+    this.doorAngle = this.doorTarget = 0;
+  }
+
+  _buildPlaceholder() {
+    const def = this.hooks.def;
+    const rings = def.rings ?? [];
+    this.digits = Number(def.digits) || 10;
+    const W = Math.max(0.8, rings.length * 0.17 + 0.42);
+    const { iron, brass, H, front } = this._buildBody(W);
+
+    // rings on an axle, in the middle of the door
+    const ringR = 0.062, ringL = 0.1, gap = 0.17;
+    const cy = H * 0.5, x0 = W / 2 - 0.06;
+    const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, rings.length * gap + 0.04, 16), iron);
+    axle.rotation.z = Math.PI / 2;
+    axle.position.set(x0, cy, front + ringR + 0.012);
+    this.hinge.add(axle);
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(rings.length * gap + 0.08, ringR * 2 + 0.06, 0.03), iron);
+    housing.position.set(x0, cy, front + 0.015);
+    this.hinge.add(housing);
+
+    this.rings = [];
+    rings.forEach((ring, i) => {
+      const x = x0 + (i - (rings.length - 1) / 2) * gap;
+      const geo = new THREE.CylinderGeometry(ringR, ringR, ringL, 40, 1, false);
+      geo.rotateZ(Math.PI / 2);
+      const side = new THREE.MeshStandardMaterial({ map: this._digitsTexture(), metalness: 0.6, roughness: 0.4 });
+      const mesh = new THREE.Mesh(geo, [side, brass, brass]);
+      mesh.position.set(x, cy, front + ringR + 0.012);
+      mesh.castShadow = true;
+      mesh.userData.ring = i;
+      mesh.rotation.x = this._angleFor(0);
+      this.hinge.add(mesh);
+      this.rings.push({ mesh, side, angle: this._angleFor(0), target: this._angleFor(0) });
+
+      // sigil plaque above, a pointer notch between plaque and ring
+      const plaque = new THREE.Mesh(new THREE.PlaneGeometry(0.12, 0.12),
+        new THREE.MeshStandardMaterial({ map: this._sigilTexture(ring.sigil), metalness: 0.7, roughness: 0.35 }));
+      plaque.position.set(x, cy + ringR + 0.13, front + 0.001);
+      this.hinge.add(plaque);
+      const notch = new THREE.Mesh(new THREE.ConeGeometry(0.014, 0.03, 3), brass);
+      notch.rotation.z = Math.PI;
+      notch.position.set(x, cy + ringR + 0.045, front + 0.02);
+      this.hinge.add(notch);
+    });
+
+    // the handle, on the right
+    this._buildHandle(W - 0.12, cy - 0.2, front, brass);
+  }
+
+  /** Rotation (about the ring's axis) that brings digit d to the front. */
+  _angleFor(d) {
+    return ((d + 0.5) / this.digits) * Math.PI * 2;
+  }
+
+  _digitsTexture() {
+    const n = this.digits, cell = 128;
+    const c = document.createElement("canvas");
+    c.width = cell * n; c.height = 128;
+    const g = c.getContext("2d");
+    const grad = g.createLinearGradient(0, 0, 0, 128);
+    grad.addColorStop(0, "#6e5426"); grad.addColorStop(0.5, "#b58d48"); grad.addColorStop(1, "#6e5426");
+    g.fillStyle = grad; g.fillRect(0, 0, c.width, 128);
+    g.strokeStyle = "rgba(30,20,8,0.7)"; g.lineWidth = 4;
+    for (let d = 0; d <= n; d++) { g.beginPath(); g.moveTo(d * cell, 0); g.lineTo(d * cell, 128); g.stroke(); }
+    g.fillStyle = "#1c1206"; g.textAlign = "center"; g.textBaseline = "middle"; g.font = "bold 92px serif";
+    for (let d = 0; d < n; d++) {
+      g.save();
+      g.translate(d * cell + cell / 2, 64);
+      g.rotate(Math.PI / 2); // the strip wraps the ring sideways: turn each digit so it reads upright
+      g.fillText(String(d), 0, 4);
+      g.restore();
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  _sigilTexture(sigil) {
+    const c = document.createElement("canvas");
+    c.width = c.height = 256;
+    const g = c.getContext("2d");
+    const grad = g.createRadialGradient(128, 110, 20, 128, 128, 150);
+    grad.addColorStop(0, "#b8924e"); grad.addColorStop(1, "#5b431e");
+    g.fillStyle = grad; g.fillRect(0, 0, 256, 256);
+    g.strokeStyle = "#2a1c0b"; g.lineWidth = 10; g.strokeRect(6, 6, 244, 244);
+    g.fillStyle = g.strokeStyle = "#24180a";
+    drawSigil(g, sigil, 256);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  _bindEvents() {
+    const el = this.renderer.domElement;
+    el.addEventListener("contextmenu", ev => ev.preventDefault());
+    el.addEventListener("pointermove", ev => {
+      el.style.cursor = this.hooks.canInteract() && this._pick(ev) ? "pointer" : "";
+    });
+    el.addEventListener("pointerdown", ev => {
+      if (ev.button !== 0 || !this.hooks.canInteract()) return;
+      const hit = this._pick(ev);
+      if (!hit) return;
+      ev.preventDefault();
+      if (hit.handle) return this.hooks.onTry();
+      // the upper half of a ring turns it up, the lower half down
+      const local = hit.mesh.parent.worldToLocal(hit.point.clone());
+      this.hooks.onTurn(hit.ring, local.y >= hit.mesh.position.y ? 1 : -1);
+    });
+    // over a ring, the mouse wheel turns it instead of zooming
+    this.container.addEventListener("wheel", ev => {
+      if (!this.hooks.canInteract()) return;
+      const hit = this._pick(ev);
+      if (!hit || hit.handle) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const now = performance.now();
+      if (now - (this._lastWheel ?? 0) < 120) return;
+      this._lastWheel = now;
+      this.hooks.onTurn(hit.ring, ev.deltaY < 0 ? 1 : -1);
+    }, { capture: true, passive: false });
+  }
+
+  _pick(ev) {
+    this._setPointer(ev);
+    const hit = this.raycaster.intersectObjects([...this.rings.map(r => r.mesh), ...this.handleParts], false)[0];
+    if (!hit) return null;
+    if (hit.object.userData.handle) return { handle: true };
+    return { ring: hit.object.userData.ring, mesh: hit.object, point: hit.point };
+  }
+
+  update(state) {
+    const full = Math.PI * 2;
+    this.rings.forEach((r, i) => {
+      // turn the short way round to the new digit
+      let target = this._angleFor(Number(state.dials?.[i]) || 0);
+      target += Math.round((r.target - target) / full) * full;
+      r.target = target;
+    });
+    const stuck = (state.lockedUntil ?? 0) > Date.now();
+    for (const r of this.rings) r.side.emissive.setHex(stuck ? 0x3a0800 : state.solved ? 0x14300c : 0x000000);
+    clearTimeout(this._stuckTimer);
+    if (stuck) this._stuckTimer = setTimeout(() => this.update(state), state.lockedUntil - Date.now() + 50);
+    const t = state.lastTry?.ts ?? 0;
+    if (this._lastTry !== undefined && t && t !== this._lastTry && !state.lastTry.ok) this._jerk();
+    this._lastTry = t;
+    this.doorTarget = state.solved ? -1.25 : 0;
+    this.handleTarget = state.solved ? -Math.PI / 2 : this.handleTarget;
+    if (!state.solved && !this._jerking) this.handleTarget = 0;
+  }
+
+  /** A wrong combination: the handle jerks halfway and falls back. */
+  _jerk() {
+    this._jerking = true;
+    this.handleTarget = -Math.PI / 4;
+    setTimeout(() => { this.handleTarget = 0; this._jerking = false; }, 300);
+  }
+
+  _loop() {
+    this.raf = requestAnimationFrame(this._loop);
+    const dt = Math.min(this.clock.getDelta(), 0.05);
+    const ease = (cur, target, speed) => cur + (target - cur) * Math.min(1, dt * speed);
+    for (const r of this.rings) {
+      r.angle = ease(r.angle, r.target, 12);
+      r.mesh.rotation.x = r.angle;
+    }
+    this.handleAngle = ease(this.handleAngle, this.handleTarget, 10);
+    this.handle.rotation.z = this.handleAngle;
+    // the door waits for the handle to turn before it swings open
+    const turned = Math.abs(this.handleAngle - this.handleTarget) < 0.05;
+    this.doorAngle = ease(this.doorAngle, this.doorTarget && !turned ? this.doorAngle : this.doorTarget, this.doorTarget ? 2.5 : 4);
+    this.hinge.rotation.y = this.doorAngle;
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  destroy() {
+    clearTimeout(this._stuckTimer);
+    super.destroy();
+  }
+}
+
+/* -------------------------------------------- */
+/*  3D rotary dial view                         */
+/* -------------------------------------------- */
+
+/** Small synthesized lock sounds (no files): the soft ratchet while turning, a tumbler's click, the clunk of a reset. */
+function lockSound(kind) {
+  const spec = { soft: [2600, 0.012, 0.04], tick: [1700, 0.035, 0.6], reset: [150, 0.2, 0.8], stuck: [90, 0.28, 0.9] }[kind];
+  if (!spec) return;
+  try {
+    const ctx = (lockSound.ctx ??= new AudioContext());
+    if (ctx.state === "suspended") ctx.resume();
+    let vol = 0.5;
+    try { vol = game.settings.get("core", "globalInterfaceVolume") ?? 0.5; } catch (err) { /* setting missing */ }
+    const [freq, len, level] = spec;
+    const t = ctx.currentTime;
+    // a short noise burst through a band-pass filter
+    const buf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * len), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 3);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = freq;
+    filter.Q.value = kind === "soft" ? 1 : 4;
+    const gain = ctx.createGain();
+    gain.gain.value = level * vol * 2;
+    src.connect(filter).connect(gain).connect(ctx.destination);
+    src.start(t);
+    if (kind === "tick") {
+      // the metallic ring after the click
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = 2400;
+      g.gain.setValueAtTime(0.18 * vol, t + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+      o.connect(g).connect(ctx.destination);
+      o.start(t + 0.03);
+      o.stop(t + 0.13);
+    }
+  } catch (err) { /* no audio */ }
+}
+
+/**
+ * A safe door with a round combination dial and a handle. Drag the dial around and let go to stop on a number; the
+ * numbers grow turning right (clockwise). Reuses the vault body and handle of DialView.
+ */
+class RotaryView extends DialView {
+  _buildPlaceholder() {
+    const def = this.hooks.def;
+    const steps = def.rings ?? [];
+    this.digits = Number(def.digits) || 40;
+    this.stepAngle = (Math.PI * 2) / this.digits;
+    this.rings = [];
+    const W = 0.9;
+    const { brass, H, front } = this._buildBody(W);
+    this.hingeX = this.hinge.position.x;
+    const cx = W / 2 - 0.05, cy = H * 0.44;
+
+    const bezel = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.012, 12, 64), brass);
+    bezel.position.set(cx, cy, front + 0.004);
+    this.hinge.add(bezel);
+
+    this.dial = new THREE.Group();
+    this.dial.position.set(cx, cy, front + 0.016);
+    this.hinge.add(this.dial);
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.135, 0.14, 0.03, 64),
+      new THREE.MeshStandardMaterial({ color: 0x2b2522, metalness: 0.85, roughness: 0.35 }));
+    body.rotation.x = Math.PI / 2;
+    const face = new THREE.Mesh(new THREE.CircleGeometry(0.133, 64),
+      new THREE.MeshStandardMaterial({ map: this._dialTexture(), metalness: 0.45, roughness: 0.5 }));
+    face.position.z = 0.0155;
+    const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 0.05, 32), brass);
+    knob.rotation.x = Math.PI / 2;
+    knob.position.z = 0.035;
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.085, 0.02), brass);
+    grip.position.z = 0.065;
+    for (const m of [body, face, knob, grip]) { m.castShadow = true; this.dial.add(m); }
+    this.dialParts = [body, face, knob, grip];
+
+    // index mark above the dial
+    const mark = new THREE.Mesh(new THREE.ConeGeometry(0.014, 0.03, 3), brass);
+    mark.rotation.z = Math.PI;
+    mark.position.set(cx, cy + 0.172, front + 0.02);
+    this.hinge.add(mark);
+
+    // one plaque per number: the sigil, and the way to turn under it
+    steps.forEach((st, i) => {
+      const x = cx + (i - (steps.length - 1) / 2) * 0.14;
+      const plaque = new THREE.Mesh(new THREE.PlaneGeometry(0.1, 0.12),
+        new THREE.MeshStandardMaterial({ map: this._stepTexture(st.sigil, rotaryDir(i)), metalness: 0.7, roughness: 0.35 }));
+      plaque.position.set(x, H - 0.19, front + 0.013);
+      this.hinge.add(plaque);
+    });
+
+    this._buildHandle(W - 0.1, cy - 0.12, front, brass);
+    this.angle = this.target = 0;
+    this.jiggle = this.shake = 0;
+  }
+
+  _dialTexture() {
+    const n = this.digits, S = 512, c0 = S / 2;
+    const c = document.createElement("canvas");
+    c.width = c.height = S;
+    const g = c.getContext("2d");
+    const grad = g.createRadialGradient(c0, c0 * 0.8, 20, c0, c0, c0);
+    grad.addColorStop(0, "#3d3631"); grad.addColorStop(1, "#1a1614");
+    g.fillStyle = grad; g.fillRect(0, 0, S, S);
+    g.strokeStyle = "#d9c7a0"; g.fillStyle = "#efe2c2"; g.textAlign = "center"; g.textBaseline = "middle";
+    for (let i = 0; i < n; i++) {
+      // numbers grow counterclockwise on the face, so turning right brings higher numbers to the mark
+      const a = -(i / n) * Math.PI * 2;
+      const sx = Math.sin(a), sy = -Math.cos(a);
+      const long = i % 5 === 0;
+      g.lineWidth = long ? 6 : 3;
+      g.beginPath();
+      g.moveTo(c0 + sx * 252, c0 + sy * 252);
+      g.lineTo(c0 + sx * (long ? 212 : 230), c0 + sy * (long ? 212 : 230));
+      g.stroke();
+      if (long) {
+        g.save();
+        g.translate(c0 + sx * 178, c0 + sy * 178);
+        g.rotate(a);
+        g.font = "bold 44px serif";
+        g.fillText(String(i), 0, 2);
+        g.restore();
+      }
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 4;
+    return tex;
+  }
+
+  /** A plaque: the sigil, and an arrow for the way to turn (clockwise = right). */
+  _stepTexture(sigil, dir) {
+    const c = document.createElement("canvas");
+    c.width = 256; c.height = 308;
+    const g = c.getContext("2d");
+    const grad = g.createRadialGradient(128, 110, 20, 128, 150, 190);
+    grad.addColorStop(0, "#b8924e"); grad.addColorStop(1, "#5b431e");
+    g.fillStyle = grad; g.fillRect(0, 0, 256, 308);
+    g.strokeStyle = "#2a1c0b"; g.lineWidth = 10; g.strokeRect(6, 6, 244, 296);
+    g.fillStyle = g.strokeStyle = "#24180a";
+    g.save(); g.translate(38, 4); drawSigil(g, sigil, 180); g.restore();
+    const cx = 128, cy = 272, r = 44, a0 = -Math.PI * 0.95, a1 = -Math.PI * 0.05;
+    g.lineWidth = 14;
+    g.beginPath();
+    if (dir > 0) g.arc(cx, cy, r, a0, a1); else g.arc(cx, cy, r, a1, a0, true);
+    g.stroke();
+    const end = dir > 0 ? a1 : a0;
+    const ex = cx + Math.cos(end) * r, ey = cy + Math.sin(end) * r;
+    const tang = end + (dir > 0 ? Math.PI / 2 : -Math.PI / 2);
+    g.beginPath();
+    g.moveTo(ex + Math.cos(tang) * 30, ey + Math.sin(tang) * 30);
+    g.lineTo(ex + Math.cos(tang + 2.2) * 24, ey + Math.sin(tang + 2.2) * 24);
+    g.lineTo(ex + Math.cos(tang - 2.2) * 24, ey + Math.sin(tang - 2.2) * 24);
+    g.closePath();
+    g.fill();
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  /** Number under the mark for a dial rotation. */
+  _posFor(angle) {
+    const n = this.digits;
+    return ((Math.round(-angle / this.stepAngle) % n) + n) % n;
+  }
+
+  _bindEvents() {
+    const el = this.renderer.domElement;
+    el.addEventListener("contextmenu", ev => ev.preventDefault());
+    el.addEventListener("pointermove", ev => {
+      if (this.spin) return this._spinMove(ev);
+      const hit = this.hooks.canInteract() ? this._pick(ev) : null;
+      el.style.cursor = !hit ? "" : hit.handle ? "pointer" : "grab";
+    });
+    el.addEventListener("pointerdown", ev => {
+      if (ev.button !== 0 || !this.hooks.canInteract()) return;
+      const hit = this._pick(ev);
+      if (!hit) return;
+      ev.preventDefault();
+      if (hit.handle) return this.hooks.onTry();
+      el.setPointerCapture(ev.pointerId);
+      this.angle = this.target; // pick it up where it is heading
+      this.spin = { start: this.angle, last: this._pointerAngle(ev), lastPos: this._posFor(this.angle) };
+      el.style.cursor = "grabbing";
+    });
+    const end = ev => {
+      if (!this.spin) return;
+      if (el.hasPointerCapture?.(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
+      const spin = this.spin;
+      this.spin = null;
+      el.style.cursor = "";
+      const snapped = Math.round(this.angle / this.stepAngle) * this.stepAngle;
+      this.target = snapped;
+      const net = snapped - spin.start;
+      if (Math.abs(net) < this.stepAngle / 2) return;
+      // clockwise (the angle goes down) is "right"
+      this._send(this._posFor(snapped), net < 0 ? 1 : -1);
+    };
+    el.addEventListener("pointerup", end);
+    el.addEventListener("pointercancel", end);
+  }
+
+  _pick(ev) {
+    this._setPointer(ev);
+    const hit = this.raycaster.intersectObjects([...this.dialParts, ...this.handleParts], false)[0];
+    if (!hit) return null;
+    return hit.object.userData.handle ? { handle: true } : { dial: true };
+  }
+
+  /** Angle of the pointer around the dial's center on screen, counterclockwise like the dial's rotation. */
+  _pointerAngle(ev) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const p = this.dial.getWorldPosition(new THREE.Vector3()).project(this.camera);
+    const cx = r.left + ((p.x + 1) / 2) * r.width, cy = r.top + ((1 - p.y) / 2) * r.height;
+    return Math.atan2(-(ev.clientY - cy), ev.clientX - cx);
+  }
+
+  _spinMove(ev) {
+    const a = this._pointerAngle(ev);
+    let d = a - this.spin.last;
+    if (d > Math.PI) d -= Math.PI * 2;
+    else if (d < -Math.PI) d += Math.PI * 2;
+    this.spin.last = a;
+    this.angle += d;
+    this.target = this.angle;
+    const pos = this._posFor(this.angle);
+    if (pos !== this.spin.lastPos) { this.spin.lastPos = pos; lockSound("soft"); }
+  }
+
+  /** Turn to a number the given way (1 = right) without dragging, e.g. from the side panel. */
+  spinTo(to, dir) {
+    if (!this.hooks.canInteract() || this.spin) return;
+    const n = this.digits, cur = this._posFor(this.target);
+    let delta = dir > 0 ? (((to - cur) % n) + n) % n : (((cur - to) % n) + n) % n;
+    if (!delta) delta = n;
+    this.target -= dir * delta * this.stepAngle;
+    this._send(to, dir);
+  }
+
+  async _send(to, dir) {
+    const r = await this.hooks.onSpin(to, dir);
+    // refused (stuck, solved...): go back to where the lock really is
+    if (!r?.ok && this._state) this.update(this._state);
+  }
+
+  update(state) {
+    this._state = state;
+    if (!this.spin) {
+      const full = Math.PI * 2;
+      let t = -(Number(state.pos) || 0) * this.stepAngle;
+      t += Math.round((this.target - t) / full) * full;
+      this.target = t;
+    }
+    const last = state.last;
+    if (this._lastTs !== undefined && last?.ts && last.ts !== this._lastTs) this._feedback(last.kind);
+    this._lastTs = last?.ts ?? 0;
+    this.doorTarget = state.solved ? -1.25 : 0;
+    if (state.solved) this.handleTarget = -Math.PI / 2;
+    else if (!this._jerking) this.handleTarget = 0;
+  }
+
+  _feedback(kind) {
+    if (kind === "tick") { lockSound("tick"); this.jiggle = 0.25; }
+    else if (kind === "reset") { lockSound("reset"); this.shake = 0.3; }
+    else if (kind === "stuck") { lockSound("stuck"); this.shake = 0.3; this._jerk(); }
+  }
+
+  _loop() {
+    this.raf = requestAnimationFrame(this._loop);
+    const dt = Math.min(this.clock.getDelta(), 0.05);
+    const ease = (cur, target, speed) => cur + (target - cur) * Math.min(1, dt * speed);
+    if (!this.spin) {
+      const before = this._posFor(this.angle);
+      this.angle = ease(this.angle, this.target, 8);
+      if (this._posFor(this.angle) !== before) lockSound("soft");
+    }
+    let wobble = 0;
+    if (this.jiggle > 0) { this.jiggle -= dt; wobble = Math.sin(this.jiggle * 90) * 0.04 * this.jiggle; }
+    this.dial.rotation.z = this.angle + wobble;
+    if (this.shake > 0) { this.shake -= dt; this.hinge.position.x = this.hingeX + Math.sin(this.shake * 100) * 0.012 * this.shake; }
+    else this.hinge.position.x = this.hingeX;
+    this.handleAngle = ease(this.handleAngle, this.handleTarget, 10);
+    this.handle.rotation.z = this.handleAngle;
+    const turned = Math.abs(this.handleAngle - this.handleTarget) < 0.05;
+    this.doorAngle = ease(this.doorAngle, this.doorTarget && !turned ? this.doorAngle : this.doorTarget, this.doorTarget ? 2.5 : 4);
+    this.hinge.rotation.y = this.doorAngle;
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+}
+
+/* -------------------------------------------- */
 /*  Window                                      */
 /* -------------------------------------------- */
 
@@ -1333,6 +2125,8 @@ class PuzzleWindow extends ApplicationV2 {
 
   get def() { return getDef(this.puzzleId); }
   get isSlots() { return this.def.type === "slots"; }
+  get isDial() { return this.def.type === "dial"; }
+  get isRotary() { return this.def.type === "rotary"; }
   get state() { return getState(this.sceneDoc, this.puzzleId); }
   get isOperator() { return this.state.lock?.userId === game.user.id; }
 
@@ -1361,9 +2155,13 @@ class PuzzleWindow extends ApplicationV2 {
     const stage = this.element.querySelector(".tp-stage");
     const side = this.element.querySelector(".tp-side");
     const slots = this.isSlots;
-    this.view = new (slots ? SlotsView : ScaleView)(stage, {
+    this.element.classList.toggle("tp-dial", this.isDial || this.isRotary);
+    this.view = new (this.isRotary ? RotaryView : this.isDial ? DialView : slots ? SlotsView : ScaleView)(stage, {
       def: this.def,
       canInteract: () => this.mode === "interact" && this.isOperator,
+      onTurn: (ring, delta) => this._act("turnDial", { ring, delta }),
+      onTry: () => this._act(this.isRotary ? "tryRotary" : "tryDial"),
+      onSpin: (to, dir) => this._act("spinRotary", { to, dir }),
       onTake: async entryId => !!(await this._act(slots ? "takeSlot" : "take", { entryId }))?.ok,
       onMove: async (entryId, pan) => !!(await this._act(slots ? "moveSlot" : "move", slots ? { entryId, slot: pan } : { entryId, pan }))?.ok,
       onDrop: (data, pan) => (slots ? this._dropSlot(data, pan) : this._drop(data, pan)),
@@ -1438,6 +2236,8 @@ class PuzzleWindow extends ApplicationV2 {
     const def = this.def;
     const noun = def.noun ?? "scale";
     el.querySelector(".tp-hint").textContent = !operating ? "Watching • Right-drag: orbit • Wheel: zoom"
+      : this.isDial ? "Click the top or bottom of a ring (or scroll over it) to turn it • Click the handle to try • Right-drag: orbit"
+      : this.isRotary ? "Drag the dial around to turn it; let go to stop on a number • Click the handle to try • Right-drag: orbit"
       : this.isSlots ? "Drag a piece from the list onto a slot • Drag pieces between slots or back onto the list • Right-drag: orbit • Wheel: zoom"
       : "Drag objects with the left mouse button • Right-drag: orbit • Wheel: zoom • Drag items from the list onto a pan";
 
@@ -1447,7 +2247,32 @@ class PuzzleWindow extends ApplicationV2 {
       ? `<i class="fa-solid fa-hand"></i> <b>${who}</b> is using the ${noun}${lock.userId === game.user.id ? " (you)" : ""}.`
       : `<i class="fa-solid fa-eye"></i> Nobody is using the ${noun}.`;
 
-    if (this.isSlots) {
+    if (this.isRotary) {
+      const stuckFor = Math.ceil(((state.lockedUntil ?? 0) - Date.now()) / 1000);
+      const steps = (def.rings ?? []).length;
+      const gm = game.user.isGM
+        ? `<div><span>Code (GM)</span><b>${parseCode(def.code, steps).join("-")}</b></div>
+           <div><span>Clicks so far (GM)</span><b>${state.step ?? 0} / ${steps}</b></div>
+           <div><span>Wrong tries</span><b>${state.wrong ?? 0}</b></div>` : "";
+      const said = { tick: "Click.", reset: "Clunk. The tumblers fell back.", stuck: "The handle won't budge.", open: "" }[state.last?.kind] ?? "";
+      el.querySelector(".tp-weights").innerHTML = `<div><span>Dial</span><b>${Number(state.pos) || 0}</b></div>${gm}`
+        + (said ? `<p class="tp-rotary-said">${said}</p>` : "")
+        + (stuckFor > 0 ? `<p class="tp-stuck"><i class="fa-solid fa-lock"></i> The dial is stuck (${stuckFor} s).</p>` : "")
+        + (state.solved ? `<p class="tp-solved"><i class="fa-solid fa-check"></i> Open.</p>` : "");
+      clearTimeout(this._stuckTimer);
+      if (stuckFor > 0) this._stuckTimer = setTimeout(() => this.refresh(), 1000);
+    } else if (this.isDial) {
+      const esc = foundry.utils.escapeHTML;
+      const stuckFor = Math.ceil(((state.lockedUntil ?? 0) - Date.now()) / 1000);
+      const gm = game.user.isGM
+        ? `<div><span>Code (GM)</span><b>${parseCode(def.code, def.rings.length).join("-")}</b></div>
+           <div><span>Wrong attempts</span><b>${state.wrong ?? 0}</b></div>` : "";
+      el.querySelector(".tp-weights").innerHTML = `<div><span>Rings</span><b>${esc((state.dials ?? []).join(" · "))}</b></div>${gm}`
+        + (stuckFor > 0 ? `<p class="tp-stuck"><i class="fa-solid fa-lock"></i> The rings are stuck (${stuckFor} s).</p>` : "")
+        + (state.solved ? `<p class="tp-solved"><i class="fa-solid fa-check"></i> Open.</p>` : "");
+      clearTimeout(this._stuckTimer);
+      if (stuckFor > 0) this._stuckTimer = setTimeout(() => this.refresh(), 1000);
+    } else if (this.isSlots) {
       const esc = foundry.utils.escapeHTML;
       const pieces = knownPieces();
       const stuckFor = Math.ceil(((state.lockedUntil ?? 0) - Date.now()) / 1000);
@@ -1481,10 +2306,11 @@ class PuzzleWindow extends ApplicationV2 {
     if (game.user.isGM) {
       if (lock && !operating) btn("Release", "fa-unlock", () => this._act("release"));
       if (this.isSlots) btn("Setup", "fa-gear", () => new SlotsEditor(this.puzzleId).render(true));
+      if (this.isDial || this.isRotary) btn("Setup", "fa-gear", () => editDial(this.puzzleId));
       btn("Triggers", "fa-bolt", () => new TriggerEditor(this.puzzleId).render(true));
       btn("Reset", "fa-rotate-left", async () => {
         const ok = await DialogV2.confirm({ window: { title: `Reset ${noun}` },
-          content: this.isSlots ? "<p>Return the table to its starting state? Pieces left in the slots will be lost.</p>"
+          content: this.isDial || this.isRotary ? "<p>Lock the vault again and set the dial back to 0?</p>" : this.isSlots ? "<p>Return the table to its starting state? Pieces left in the slots will be lost.</p>"
             : "<p>Return the scale to its starting state? Items and coins left on the pans will be lost.</p>" });
         if (ok) this._act("reset");
       });
@@ -1498,6 +2324,8 @@ class PuzzleWindow extends ApplicationV2 {
     if (!operating) { box.innerHTML = ""; return; }
     const actor = this._actor();
     if (!actor) { box.innerHTML = "<p>Character not found.</p>"; return; }
+    if (this.isRotary) return this._renderRotary(box, actor);
+    if (this.isDial) return this._renderDial(box, actor);
     if (this.isSlots) return this._renderPieces(box, actor);
     const items = actor.items.filter(i => itemKgEach(i) > 0 && i.system.quantity !== 0)
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -1528,6 +2356,49 @@ class PuzzleWindow extends ApplicationV2 {
         if (amount > 0) await this._act("placeCurrency", { denom: input.dataset.denom, amount, pan: b.dataset.pan });
       }
     }));
+  }
+
+  /** Dials: a row of buttons per ring and the handle (the same as clicking them in 3D). */
+  _renderDial(box, actor) {
+    const esc = foundry.utils.escapeHTML;
+    const state = this.state;
+    const rings = this.def.rings ?? [];
+    const off = state.solved ? "disabled" : "";
+    box.innerHTML = `
+      <h3>${esc(actor.name)}</h3>
+      <div class="tp-dial-rings">${rings.map((r, i) => `
+        <div class="tp-dial-ring">
+          <button type="button" data-ring="${i}" data-delta="1" ${off}><i class="fa-solid fa-chevron-up"></i></button>
+          <b>${Number(state.dials?.[i]) || 0}</b>
+          <button type="button" data-ring="${i}" data-delta="-1" ${off}><i class="fa-solid fa-chevron-down"></i></button>
+        </div>`).join("")}</div>
+      <button type="button" class="tp-dial-try" ${off}><i class="fa-solid fa-hand-back-fist"></i> Turn the handle</button>`;
+    box.querySelectorAll("[data-ring]").forEach(b => b.addEventListener("click", () =>
+      this._act("turnDial", { ring: Number(b.dataset.ring), delta: Number(b.dataset.delta) })));
+    box.querySelector(".tp-dial-try").addEventListener("click", () => this._act("tryDial"));
+  }
+
+  /** Rotary dials: turn to a number (right or left) without dragging, and the handle. */
+  _renderRotary(box, actor) {
+    const esc = foundry.utils.escapeHTML;
+    const state = this.state;
+    const n = Number(this.def.digits) || 40;
+    const off = state.solved ? "disabled" : "";
+    box.innerHTML = `
+      <h3>${esc(actor.name)}</h3>
+      <p class="tp-note">Each stop counts: stop on the right number turning the right way and the lock clicks.</p>
+      <div class="tp-rotary-turn">
+        <button type="button" data-dir="-1" ${off} data-tooltip="Turn left (counterclockwise)"><i class="fa-solid fa-rotate-left"></i></button>
+        <input type="number" min="0" max="${n - 1}" value="${Number(state.pos) || 0}" ${off}>
+        <button type="button" data-dir="1" ${off} data-tooltip="Turn right (clockwise)"><i class="fa-solid fa-rotate-right"></i></button>
+      </div>
+      <button type="button" class="tp-dial-try" ${off}><i class="fa-solid fa-hand-back-fist"></i> Turn the handle</button>`;
+    const input = box.querySelector("input");
+    box.querySelectorAll("[data-dir]").forEach(b => b.addEventListener("click", () => {
+      const to = ((Math.round(Number(input.value) || 0) % n) + n) % n;
+      this.view?.spinTo?.(to, Number(b.dataset.dir));
+    }));
+    box.querySelector(".tp-dial-try").addEventListener("click", () => this._act("tryRotary"));
   }
 
   /** Slot tables: list the pieces (items with a puzzle key) the character carries. */
@@ -1594,7 +2465,7 @@ class TriggerEditor extends ApplicationV2 {
     const esc = v => foundry.utils.escapeHTML(String(v ?? ""));
     const opts = (map, cur) => Object.entries(map).map(([k, v]) =>
       `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(typeof v === "string" ? v : v.label)}</option>`).join("");
-    const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args", "walls", "src"];
+    const wide = ["flavor", "text", "animation", "sound", "uuid", "name", "args", "walls", "tiles", "src"];
     const field = (key, val) => key === "rollMode"
       ? `<label class="tpt-f tpt-wide"><span>${key}</span><select data-k="${key}">${opts(ROLL_MODES, val)}</select></label>`
       : key === "state"
@@ -1826,6 +2697,48 @@ class SlotsEditor extends ApplicationV2 {
   }
 }
 
+/* -------------------------------------------- */
+/*  Dial setup (GM)                             */
+/* -------------------------------------------- */
+
+const DIAL_FIELDS = ["code", "rings", "openSound", "wrongSound", "wrongLockSeconds", "wrongText", "wrongGmText"];
+
+/** Edit a dial: the combination, the sigil on each ring, and what a wrong try does. */
+async function editDial(puzzleId) {
+  const def = getDef(puzzleId);
+  const esc = v => foundry.utils.escapeHTML(String(v ?? ""));
+  const opts = cur => Object.entries(SIGILS).map(([k, v]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(v)}</option>`).join("");
+  const rings = def.rings ?? [];
+  const content = `<div class="tpt-root">
+    <p class="tpt-help">${def.type === "rotary" ? `One number per step, 0–${(Number(def.digits) || 40) - 1}, separated by dashes (e.g. 6-2-9): right to the 1st, left to the 2nd, right to the 3rd. The sigils are engraved above the dial, in order.` : "One digit per ring, left to right (e.g. 6-2-9). The sigil is engraved above its ring."}</p>
+    <label class="tpt-f tpt-wide"><span>combination</span><input type="text" name="code" value="${esc(parseCode(def.code, rings.length).join("-"))}"></label>
+    ${rings.map((r, i) => `<label class="tpt-f tpt-wide"><span>${def.type === "rotary" ? "number" : "ring"} ${i + 1}</span><select name="sigil${i}">${opts(r.sigil)}</select></label>`).join("")}
+    <label class="tpt-f"><span>lock after a wrong try (s)</span><input type="number" name="wrongLockSeconds" value="${esc(def.wrongLockSeconds)}"></label>
+    <label class="tpt-f tpt-wide"><span>open sound</span><input type="text" name="openSound" value="${esc(def.openSound)}"></label>
+    <label class="tpt-f tpt-wide"><span>wrong sound</span><input type="text" name="wrongSound" value="${esc(def.wrongSound)}"></label>
+    <label class="tpt-f tpt-wide"><span>public text</span><input type="text" name="wrongText" value="${esc(def.wrongText)}"></label>
+    <label class="tpt-f tpt-wide"><span>GM text</span><input type="text" name="wrongGmText" value="${esc(def.wrongGmText)}"></label>
+  </div>`;
+  const data = await DialogV2.prompt({
+    window: { title: `${def.title} — setup`, icon: "fa-solid fa-gear" },
+    classes: ["theia-puzzle-triggers"],
+    content,
+    ok: { label: "Save", icon: "fa-solid fa-floppy-disk", callback: (ev, btn) => new foundry.applications.ux.FormDataExtended(btn.form).object },
+    rejectClose: false
+  });
+  if (!data) return;
+  const cfg = {
+    code: parseCode(String(data.code).replace(/[^0-9]+/g, "-").replace(/^-|-$/g, ""), rings.length).join("-"),
+    rings: rings.map((r, i) => ({ ...r, sigil: data[`sigil${i}`] ?? r.sigil, label: SIGILS[data[`sigil${i}`]] ?? r.label })),
+    openSound: data.openSound ?? "", wrongSound: data.wrongSound ?? "", wrongLockSeconds: Number(data.wrongLockSeconds) || 0,
+    wrongText: data.wrongText ?? "", wrongGmText: data.wrongGmText ?? ""
+  };
+  const all = foundry.utils.deepClone(game.settings.get(MODULE_ID, "config") ?? {});
+  all[puzzleId] = Object.fromEntries(DIAL_FIELDS.map(k => [k, cfg[k]]));
+  await game.settings.set(MODULE_ID, "config", all);
+  ui.notifications.info("Theia Puzzles: vault saved. Reopen the puzzle window to see new sigils.");
+}
+
 /** Check the combination of a slot table (e.g. from a Monk's Active Tiles lever macro). */
 async function press(puzzleId, { tokenUuid, tileUuid } = {}) {
   const scene = findPuzzleScene(puzzleId) ?? canvas.scene;
@@ -1892,6 +2805,7 @@ Hooks.once("init", () => {
     open, press, PUZZLES, getDef, getState, request, getTriggers, setTriggers, registerOriginal,
     editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true),
     editSlots: id => new SlotsEditor(id ?? "l22-selos").render(true),
+    editDial: id => editDial(id ?? "l23-cofre"),
     alert: {
       ALERTS, get: getAlert,
       raise: (id, opts) => alertOp(id, "raise", opts),
