@@ -145,14 +145,34 @@ function ringLocal(id) {
   const file = soundFile(def.bell);
   const ambient = def.bellAmbientSound ? canvas.scene?.sounds.get(def.bellAmbientSound) : null;
   if (file) {
-    if (ambient) {
+    const base = def.bellVolume ?? 0.9;
+    if (ambient && ambient.walls) {
+      // Muffled by walls, as the Ambient Sound is configured.
       canvas.sounds.playAtPosition(file, { x: ambient.x, y: ambient.y, elevation: ambient.elevation ?? 0 }, ambient.radius,
-        { volume: def.bellVolume ?? 0.9, easing: ambient.easing, walls: ambient.walls, gmAlways: true }).catch(err => console.warn(err));
+        { volume: base, easing: ambient.easing, walls: true, gmAlways: true }).catch(err => console.warn(err));
+    } else if (ambient) {
+      // Not constrained by walls: volume from the distance alone. (Foundry's own path is unreliable here: Terrain
+      // Mapper 0.5.2 drops the "ignore walls" option, so walls would still block the sound.)
+      const volume = bellVolumeAt(ambient, base);
+      if (volume > 0) foundry.audio.AudioHelper.play({ src: file, volume, autoplay: true, loop: false }, false);
     } else if (!def.bellAmbientSound) {
-      foundry.audio.AudioHelper.play({ src: file, volume: def.bellVolume ?? 0.9, autoplay: true, loop: false }, false);
+      foundry.audio.AudioHelper.play({ src: file, volume: base, autoplay: true, loop: false }, false);
     }
   }
   swingTile(def.bellTile ? canvas.tiles?.get(def.bellTile) : null);
+}
+
+/** Volume for this client: the GM always hears it; players by their closest token's distance to the sound. */
+function bellVolumeAt(ambient, base) {
+  if (game.user.isGM) return base;
+  const tokens = canvas.tokens.controlled.length ? canvas.tokens.controlled
+    : canvas.tokens.placeables.filter(t => t.actor?.isOwner);
+  if (!tokens.length) return 0;
+  const radiusPx = ambient.radius * canvas.dimensions.distancePixels;
+  const d = Math.min(...tokens.map(t => Math.hypot(t.center.x - ambient.x, t.center.y - ambient.y)));
+  if (d >= radiusPx) return 0;
+  const k = 1 - d / radiusPx;
+  return base * (ambient.easing ? k * k * (3 - 2 * k) : 1);
 }
 
 /** Swing a tile like a struck bell (local animation, nothing is saved). */
