@@ -57,3 +57,17 @@ character's list take the shape of their socket. Edit everything in **Setup** (G
   conditions become true.
 
 Several tiles can open the same puzzle (flag `theia-puzzles.puzzle` on each); reach is measured to the nearest one.
+
+
+## Alert counters
+
+A dungeon-wide alarm level (0–3 for Casa Angelo, defined in `scripts/alert.js`), shown to the GM only.
+
+- `api.alert.raise(id, { source, reason, amount, bell })` raises it, rings the bell for everyone and whispers the
+  GM the new level and what it means. A raise from a **disabled source** (e.g. the T1 cable was cut) is ignored.
+- Slot tables raise it on a wrong combination (`alert` / `alertSource` in the puzzle); triggers have an
+  "Raise an alert counter" action.
+- After `decayMinutes` of **game time** without signals the GM gets a whispered card with a "Lower the alert" button.
+  After an intrusion it never drops below `floorAfterIntrusion`.
+- `api.alert.open(id)` opens the GM panel: current level, what each level does, +1 / −1 / reset, signal toggles and
+  history.

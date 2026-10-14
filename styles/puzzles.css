@@ -204,3 +204,24 @@
 .theia-puzzle-slots .tps-registry { margin: 4px 0 8px; padding-left: 18px; font-size: 12px; }
 .theia-puzzle-slots .tps-registry code { font-size: 10px; opacity: 0.6; }
 .theia-puzzle-slots .tps-slot input[type="text"] { width: 100%; }
+
+/* Alert panel */
+.theia-alert .ta-root { display: flex; flex-direction: column; gap: 6px; padding: 4px; }
+.theia-alert .ta-level { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 6px; background: #2b2b2b; color: #eee; }
+.theia-alert .ta-level .ta-num { font-size: 32px; font-weight: bold; line-height: 1; }
+.theia-alert .ta-level .ta-name { font-size: 16px; font-weight: bold; }
+.theia-alert .ta-l1 { background: #6b5a1a; }
+.theia-alert .ta-l2 { background: #8a3f12; }
+.theia-alert .ta-l3 { background: #8a1212; }
+.theia-alert .ta-quiet { margin: 0; font-size: 12px; opacity: 0.85; }
+.theia-alert .ta-buttons { display: flex; gap: 4px; }
+.theia-alert .ta-buttons select { flex: 1; }
+.theia-alert .ta-buttons button { flex: 0 0 auto; width: auto; padding: 0 8px; }
+.theia-alert .ta-levels { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.theia-alert .ta-levels li { font-size: 12px; padding: 3px 6px; border-left: 3px solid transparent; opacity: 0.65; }
+.theia-alert .ta-levels li span { display: block; }
+.theia-alert .ta-levels li.current { opacity: 1; border-left-color: #c9a35a; background: rgba(201, 163, 90, 0.12); }
+.theia-alert h4 { margin: 4px 0 0; }
+.theia-alert .ta-source { display: block; font-size: 12px; }
+.theia-alert .ta-source.off { opacity: 0.6; text-decoration: line-through; }
+.theia-alert .ta-log { margin: 0; padding-left: 16px; font-size: 11px; }

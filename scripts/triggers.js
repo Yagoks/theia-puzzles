@@ -35,7 +35,8 @@ export const ACTION_TYPES = {
   macro: { label: "Run macro", fields: { name: "", args: "" } },
   closeWindow: { label: "Close the puzzle window", fields: {} },
   door: { label: "Set doors (wall ids)", fields: { walls: "", state: "open" } },
-  sound: { label: "Play a sound for everyone", fields: { src: "", volume: 0.8 } }
+  sound: { label: "Play a sound for everyone", fields: { src: "", volume: 0.8 } },
+  alert: { label: "Raise an alert counter", fields: { id: "casa-angelo", amount: 1, reason: "" } }
 };
 
 const TOL = 0.005;
@@ -296,5 +297,6 @@ export async function runAction(action, ctx) {
       return ctx.scene.updateEmbeddedDocuments("Wall", ids.map(_id => ({ _id, ds })));
     }
     case "sound": return playSound(action.src, action.volume);
+    case "alert": return ctx.alertOp?.(action.id, "raise", { amount: Number(action.amount) || 1, reason: action.reason || ctx.def.title });
   }
 }

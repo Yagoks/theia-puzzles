@@ -13,6 +13,7 @@
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
+import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, readyAlert, registerAlert } from "./alert.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -71,9 +72,12 @@ const PUZZLES = {
     requireOriginal: true,
     pressSound: "psfx.doors.clean.lock.unlock.wooden.01",
     wrongLockSeconds: 60,
-    wrongSound: "psfx.cantrips.toll-the-dead.ominous-bell.001",
+    wrongSound: "", // the bell comes from the alert counter below
     wrongText: "The three slots lock in place with a dry clack. Somewhere in the vault, a bell rings.",
-    wrongGmText: "T9 — wrong combination: the bell rings in L11 (alert +1). The slots stay locked for a minute.",
+    wrongGmText: "T9 — wrong combination. The slots stay locked for a minute.",
+    // A wrong combination raises this alert counter (see alert.js) through the given signal.
+    alert: "casa-angelo",
+    alertSource: "t9",
     triggers: [
       {
         id: "open", name: "Seals accepted — the vault door opens", enabled: true, once: false,
@@ -543,6 +547,7 @@ async function slotsPress({ def, state, save, payload, now }) {
   if (def.wrongText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p><em>${def.wrongText}</em></p>` });
   if (def.wrongGmText) await ChatMessage.create({ speaker: { alias: def.title }, content: `<p>${def.wrongGmText}</p>`,
     whisper: ChatMessage.getWhisperRecipients("GM") });
+  if (def.alert) await alertOp(def.alert, "raise", { source: def.alertSource, reason: ALERTS[def.alert]?.sources?.[def.alertSource] ?? `${def.title}: wrong combination` });
   return { ok: true };
 }
 
@@ -706,7 +711,7 @@ async function runTriggers(scene, puzzleId, { actor, tokenDoc, userId }) {
   if (!due.length) return;
   const ctx = {
     puzzleId, def, scene, state, actor, tokenDoc, userId, tile: findPedestal(scene, puzzleId),
-    distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId), askPlayerSave
+    distanceToPedestalFt, giveItem, closeWindows: () => closeWindowsEverywhere(puzzleId), askPlayerSave, alertOp
   };
   for (const t of due) {
     Hooks.callAll(`${MODULE_ID}.trigger`, { trigger: t, ...ctx });
@@ -1873,6 +1878,7 @@ Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "triggers", { scope: "world", config: false, type: Object, default: {} });
   game.settings.register(MODULE_ID, "config", { scope: "world", config: false, type: Object, default: {} });
   game.settings.register(MODULE_ID, "instances", { scope: "world", config: false, type: Object, default: {} });
+  registerAlert();
   game.settings.registerMenu(MODULE_ID, "triggerMenu", {
     name: "Puzzle triggers", label: "Edit triggers", icon: "fa-solid fa-bolt", restricted: true,
     hint: "Conditions and actions (traps, rewards, macros...) for each puzzle.",
@@ -1881,12 +1887,21 @@ Hooks.once("init", () => {
   game.modules.get(MODULE_ID).api = {
     open, press, PUZZLES, getDef, getState, request, getTriggers, setTriggers, registerOriginal,
     editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true),
-    editSlots: id => new SlotsEditor(id ?? "l22-selos").render(true)
+    editSlots: id => new SlotsEditor(id ?? "l22-selos").render(true),
+    alert: {
+      ALERTS, get: getAlert,
+      raise: (id, opts) => alertOp(id, "raise", opts),
+      lower: (id, opts) => alertOp(id, "lower", opts),
+      set: (id, level) => alertOp(id, "set", { level }),
+      open: id => new AlertPanel(id ?? "casa-angelo").render(true)
+    }
   };
 });
 
 Hooks.once("ready", () => {
+  readyAlert();
   game.socket.on(SOCKET, async msg => {
+    if (msg.type === "alert") return onAlertSocket(msg);
     if (msg.type === "result") {
       if (msg.to === game.user.id) pending[msg.rid]?.(msg.result);
       return;
