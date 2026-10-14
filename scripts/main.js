@@ -13,7 +13,7 @@
 
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound } from "./triggers.js";
-import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, readyAlert, registerAlert } from "./alert.js";
+import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, readyAlert, registerAlert, testBell } from "./alert.js";
 
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
@@ -1893,7 +1893,8 @@ Hooks.once("init", () => {
       raise: (id, opts) => alertOp(id, "raise", opts),
       lower: (id, opts) => alertOp(id, "lower", opts),
       set: (id, level) => alertOp(id, "set", { level }),
-      open: id => new AlertPanel(id ?? "casa-angelo").render(true)
+      open: id => new AlertPanel(id ?? "casa-angelo").render(true),
+      testBell: id => testBell(id ?? "casa-angelo") // this client only
     }
   };
 });
@@ -1901,7 +1902,7 @@ Hooks.once("init", () => {
 Hooks.once("ready", () => {
   readyAlert();
   game.socket.on(SOCKET, async msg => {
-    if (msg.type === "alert") return onAlertSocket(msg);
+    if (msg.type === "alert" || msg.type === "alertBell") return onAlertSocket(msg);
     if (msg.type === "result") {
       if (msg.to === game.user.id) pending[msg.rid]?.(msg.result);
       return;

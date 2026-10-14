@@ -1,8 +1,6 @@
 // Theia Puzzles — alert counters (GM only): a dungeon-wide alarm level that traps and puzzles raise, that the GM
 // can raise or lower by hand, and that offers to drop one level after a quiet stretch of game time.
 
-import { playSound } from "./triggers.js";
-
 const MODULE_ID = "theia-puzzles";
 const SOCKET = `module.${MODULE_ID}`;
 
@@ -13,6 +11,11 @@ export const ALERTS = {
     decayMinutes: 10, // game minutes without a new signal before offering to drop a level
     floorAfterIntrusion: 1,
     bell: "psfx.cantrips.toll-the-dead.ominous-bell.001",
+    // The bell rings from this Ambient Sound (its position, radius, easing and "constrained by walls" setting)
+    // and this tile swings. Without them the bell is heard everywhere at the same volume.
+    bellAmbientSound: "TwWkXAnp7Tl8mc6J",
+    bellTile: "yzrSfxmnRhHpRl8l",
+    bellVolume: 0.9,
     levels: [
       { name: "Busca", text: "Os invasores permanecem nas posições iniciais." },
       { name: "Suspeita", text: "O Imp de L04 procura a causa do ruído. Se estiver indisponível, 1x Imp do grupo de L16 assume essa tarefa." },
@@ -64,7 +67,7 @@ async function apply(id, op, opts = {}) {
       s.log.unshift({ t: now, from: before, to: s.level, reason: s.lastReason });
       s.log = s.log.slice(0, 20);
       await saveAlert(id, s);
-      if (opts.bell !== false) playSound(def.bell, 0.9);
+      if (opts.bell !== false) ringBell(id);
       await gmWhisper(`<p><i class="fa-solid fa-bell"></i> <b>${esc(def.title)}</b>: ${before} → <b>${s.level}</b>${s.lastReason ? ` <em>(${esc(s.lastReason)})</em>` : ""}</p>
         ${s.level !== before ? `<p>${levelLine(def, s.level)}</p>` : "<p>Already at the highest level.</p>"}`);
       return { ok: true, level: s.level };
@@ -108,9 +111,67 @@ export function alertOp(id, op, opts = {}) {
 }
 
 export function onAlertSocket(msg) {
+  if (msg.type === "alertBell") { ringLocal(msg.id); return true; }
   if (msg.type !== "alert" || !isActiveGM()) return false;
   apply(msg.id, msg.op, msg.opts ?? {});
   return true;
+}
+
+/* -------------------------------------------- */
+/*  The bell                                    */
+/* -------------------------------------------- */
+
+/** Ring on every client: positional sound from the bell's Ambient Sound, and the bell tile swings. */
+function ringBell(id) {
+  game.socket.emit(SOCKET, { type: "alertBell", id });
+  ringLocal(id);
+}
+
+/** A Sequencer database key ("psfx....") or a plain path → a playable file. */
+function soundFile(src) {
+  if (!src || src.includes("/")) return src;
+  const entry = globalThis.Sequencer?.Database?.getEntry?.(src);
+  const file = Array.isArray(entry) ? entry[0]?.file : entry?.file;
+  return Array.isArray(file) ? file[Math.floor(Math.random() * file.length)] : file;
+}
+
+export function testBell(id) {
+  return ringLocal(id);
+}
+
+function ringLocal(id) {
+  const def = ALERTS[id];
+  if (!def || !canvas.ready) return;
+  const file = soundFile(def.bell);
+  const ambient = def.bellAmbientSound ? canvas.scene?.sounds.get(def.bellAmbientSound) : null;
+  if (file) {
+    if (ambient) {
+      canvas.sounds.playAtPosition(file, { x: ambient.x, y: ambient.y, elevation: ambient.elevation ?? 0 }, ambient.radius,
+        { volume: def.bellVolume ?? 0.9, easing: ambient.easing, walls: ambient.walls, gmAlways: true }).catch(err => console.warn(err));
+    } else if (!def.bellAmbientSound) {
+      foundry.audio.AudioHelper.play({ src: file, volume: def.bellVolume ?? 0.9, autoplay: true, loop: false }, false);
+    }
+  }
+  swingTile(def.bellTile ? canvas.tiles?.get(def.bellTile) : null);
+}
+
+/** Swing a tile like a struck bell (local animation, nothing is saved). */
+function swingTile(tile) {
+  const mesh = tile?.mesh;
+  if (!mesh) return;
+  const base = Math.toRadians(tile.document.rotation ?? 0);
+  const start = performance.now();
+  const duration = 3200, amplitude = Math.toRadians(16), period = 700;
+  const tick = () => {
+    const t = performance.now() - start;
+    if (t >= duration || mesh.destroyed) {
+      canvas.app.ticker.remove(tick);
+      if (!mesh.destroyed) mesh.rotation = base;
+      return;
+    }
+    mesh.rotation = base + amplitude * Math.exp(-t / 1100) * Math.sin((2 * Math.PI * t) / period);
+  };
+  canvas.app.ticker.add(tick);
 }
 
 /** GM: after a quiet stretch of game time, offer to drop one level (a button in a whispered card). */
