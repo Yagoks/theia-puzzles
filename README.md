@@ -80,6 +80,17 @@ A door with numbered rings (a cryptex) and a handle; kept for future puzzles (no
 bottom of a ring (or scroll over it) to turn it, then the handle. A wrong combination sticks the rings for a few seconds.
 Same Setup, sigils and triggers as the rotary dial.
 
+## Journal pages found with Unboxing
+
+Unboxing the Mystery grants a found journal page to the player who opened the tile only, and the journal itself is
+usually hidden, so the page can't be opened. With *Unboxing: share found journal pages with everyone* on (module
+settings, default on), when a page linked by an Unboxing tile is granted to a player the GM:
+- shares **that page** with every player (Observer);
+- makes its journal **Limited**, so it shows in the sidebar;
+- closes the journal's other pages (None), so pages nobody found stay hidden.
+
+`api.sharePage(page)` does the same by hand.
+
 ## Alert counters
 
 A dungeon-wide alarm level (0–3 for Casa Angelo, defined in `scripts/alert.js`), shown to the GM only.

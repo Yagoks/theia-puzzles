@@ -15,6 +15,7 @@
 import { THREE, OrbitControls, GLTFLoader } from "../vendor/three-bundle.js";
 import { CONDITION_TYPES, PAN_OPTIONS, OPS, ROLL_MODES, ACTION_TYPES, DOOR_STATES, conditionsMet, runAction, playSound, saveLinkFlags } from "./triggers.js";
 import { doorGm, registerDoors } from "./doors.js";
+import { registerJournals, sharePage } from "./journals.js";
 import { ALERTS, AlertPanel, alertOp, getAlert, onAlertSocket, openAlert, readyAlert, registerAlert, testBell } from "./alert.js";
 
 const MODULE_ID = "theia-puzzles";
@@ -2806,6 +2807,7 @@ Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "instances", { scope: "world", config: false, type: Object, default: {} });
   registerAlert();
   registerDoors(request);
+  registerJournals();
   game.settings.registerMenu(MODULE_ID, "triggerMenu", {
     name: "Puzzle triggers", label: "Edit triggers", icon: "fa-solid fa-bolt", restricted: true,
     hint: "Conditions and actions (traps, rewards, macros...) for each puzzle.",
@@ -2816,6 +2818,7 @@ Hooks.once("init", () => {
     editTriggers: id => new TriggerEditor(id ?? Object.keys(PUZZLES)[0]).render(true),
     editSlots: id => new SlotsEditor(id ?? "l22-selos").render(true),
     editDial: id => editDial(id ?? "l23-cofre"),
+    sharePage,
     alert: {
       ALERTS, get: getAlert,
       raise: (id, opts) => alertOp(id, "raise", opts),
