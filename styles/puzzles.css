@@ -250,3 +250,6 @@
 .theia-puzzle .tp-rotary-turn input { width: 64px; font-size: 22px; font-family: serif; text-align: center; height: 34px; }
 .theia-puzzle .tp-rotary-turn button { width: 44px; height: 34px; padding: 0; }
 .theia-puzzle .tp-rotary-said { margin: 6px 0 0; font-style: italic; color: #e8c77a; }
+
+.tp-door-config .tp-d-toggle { cursor: pointer; user-select: none; }
+.tp-door-config .tp-d-toggle:hover { text-decoration: underline; }

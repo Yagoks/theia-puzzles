@@ -249,7 +249,8 @@ function onRenderWallConfig(app, html) {
   const fs = document.createElement("fieldset");
   fs.className = "tp-door-config";
   const opt = (map, cur) => Object.entries(map).map(([k, v]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(v.label ?? v)}</option>`).join("");
-  fs.innerHTML = `<legend>Theia — porta trancada</legend>
+  fs.innerHTML = `<legend class="tp-d-toggle" title="Mostrar ou esconder as opções"><i class="fa-solid fa-caret-right"></i> Theia — porta trancada${door ? " (ativa)" : ""}</legend>
+    <div class="tp-d-body" hidden>
     <div class="form-group"><label>Ativa</label><input type="checkbox" class="tp-d-on" ${door ? "checked" : ""}></div>
     <div class="form-group"><label>Material</label><select class="tp-d-mat">${opt(DOOR_MATERIALS, door?.material ?? "pedra")}</select></div>
     <div class="form-group"><label>Chave (nome do item)</label><input type="text" class="tp-d-key" value="${esc(door?.key ?? "")}"></div>
@@ -258,7 +259,17 @@ function onRenderWallConfig(app, html) {
     <div class="form-group"><label>Combinação (id do puzzle)</label><input type="text" class="tp-d-combo" value="${esc(door?.combo ?? "")}">
       <p class="hint">Ex.: <code>l23-cofre</code>. A porta fica sem fechadura (sem lockpick) e "Inserir combinação" abre esse puzzle; o gatilho do puzzle abre a porta.</p></div>
     <div class="form-group"><label>Dano recebido</label><input type="number" class="tp-d-dmg" value="${Number(door?.damage) || 0}" min="0">
-      <p class="hint">${door ? `AC ${door.ac}, ${door.hp} HP, limiar de dano ${door.threshold}${door.broken ? " — arrombada" : ""}.` : ""}</p></div>`;
+      <p class="hint">${door ? `AC ${door.ac}, ${door.hp} HP, limiar de dano ${door.threshold}${door.broken ? " — arrombada" : ""}.` : ""}</p></div>
+    </div>`;
+  // Collapsed by default: clicking the title shows or hides the options and resizes the window.
+  fs.querySelector(".tp-d-toggle").addEventListener("click", () => {
+    const body = fs.querySelector(".tp-d-body");
+    body.hidden = !body.hidden;
+    const icon = fs.querySelector(".tp-d-toggle i");
+    icon.classList.toggle("fa-caret-right", body.hidden);
+    icon.classList.toggle("fa-caret-down", !body.hidden);
+    app.setPosition?.({ height: "auto" });
+  });
   const save = async () => {
     if (!fs.querySelector(".tp-d-on").checked) return wall.update({ [`flags.${MODULE_ID}.-=door`]: null });
     const damage = Number(fs.querySelector(".tp-d-dmg").value) || 0;
